@@ -1,0 +1,789 @@
+const path = require("node:path");
+const fs = require("node:fs");
+const express = require("express");
+const cors = require("cors");
+const { MOCK_SOURCE_FIXTURES } = require("./mock/rawFixtures.cjs");
+const { fetchNseDocuments } = require("./adapters/nseAdapter.cjs");
+const { fetchBseDocuments } = require("./adapters/bseAdapter.cjs");
+const { fetchSebiDocuments } = require("./adapters/sebiAdapter.cjs");
+const {
+  buildCompanies,
+  inferDocumentType,
+  inferPublishedAt,
+  inferSearchText,
+  inferSymbol,
+  matchesDocType,
+  sortRawDocuments,
+  withinDateRange,
+} = require("./utils/documentHelpers.cjs");
+
+const PORT = Number(process.env.PORT || 8787);
+const OPENAI_API_KEY = `${process.env.OPENAI_API_KEY || ""}`.trim();
+const OPENAI_MODEL = `${process.env.OPENAI_MODEL || "gpt-4.1-mini"}`.trim();
+const DIST_DIR = path.resolve(__dirname, "..", "dist");
+const DIST_INDEX_FILE = path.join(DIST_DIR, "index.html");
+const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
+const app = express();
+
+const SUMMARY_REGEX = /\b(summary|summarize|deep analysis|analysis|overview|digest)\b/i;
+
+app.use(cors());
+app.use(express.json());
+
+async function loadRawDocuments(symbol) {
+  const [nseLive, bseLive, sebiLive] = await Promise.all([
+    fetchNseDocuments(symbol),
+    fetchBseDocuments(symbol),
+    fetchSebiDocuments(symbol),
+  ]);
+
+  const nse = nseLive.length > 0 ? nseLive : MOCK_SOURCE_FIXTURES.nse;
+  const bse = bseLive.length > 0 ? bseLive : MOCK_SOURCE_FIXTURES.bse;
+  const sebi = sebiLive.length > 0 ? sebiLive : MOCK_SOURCE_FIXTURES.sebi;
+
+  return [...nse, ...bse, ...sebi];
+}
+
+function inferTitle(raw) {
+  if (raw.provider === "NSE") return raw.headline || "NSE filing";
+  if (raw.provider === "BSE") return raw.subject || "BSE disclosure";
+  if (raw.provider === "SEBI") return `${raw.document_kind || "SEBI"} filing`;
+  return "Document";
+}
+
+function inferDescription(raw) {
+  if (raw.provider === "NSE") return raw.details || "";
+  if (raw.provider === "BSE") return raw.note || "";
+  if (raw.provider === "SEBI") return raw.summary || "";
+  return "";
+}
+
+function inferQuarter(raw) {
+  if (raw.provider === "NSE") return raw.quarter || "";
+  if (raw.provider === "BSE") return raw.quarter || "";
+  return "";
+}
+
+function inferFiscalYear(raw) {
+  if (raw.provider === "NSE") return raw.fiscal_year || "";
+  if (raw.provider === "BSE") return raw.fiscal_year || "";
+  return "";
+}
+
+function inferCompanyName(raw) {
+  if (raw.provider === "NSE") return raw.company_name || raw.symbol || "Unknown company";
+  if (raw.provider === "BSE") return raw.company || raw.symbol || "Unknown company";
+  if (raw.provider === "SEBI") return raw.issuer_name || raw.symbol || "Unknown company";
+  return raw.symbol || "Unknown company";
+}
+
+function inferSourceName(raw) {
+  if (raw.provider === "NSE") return "NSE corporate filings";
+  if (raw.provider === "BSE") return "BSE corporate disclosures";
+  if (raw.provider === "SEBI") return "SEBI filings";
+  return "Public filing";
+}
+
+function inferSourceUrl(raw) {
+  if (raw.provider === "NSE") return raw.page_url || raw.file_url || "";
+  if (raw.provider === "BSE") return raw.link || raw.attachment || "";
+  if (raw.provider === "SEBI") return raw.page_url || raw.pdf_url || "";
+  return "";
+}
+
+function inferFileUrl(raw) {
+  if (raw.provider === "NSE") return raw.file_url || "";
+  if (raw.provider === "BSE") return raw.attachment || "";
+  if (raw.provider === "SEBI") return raw.pdf_url || "";
+  return "";
+}
+
+function stableHash(seed) {
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return Math.abs(hash >>> 0).toString(16);
+}
+
+function inferNormalizedId(raw) {
+  if (raw.provider === "NSE") {
+    return `doc_${stableHash(`${raw.provider}-${raw.filing_id}-${raw.symbol}-${raw.published_at}`)}`;
+  }
+
+  if (raw.provider === "BSE") {
+    return `doc_${stableHash(`${raw.provider}-${raw.notice_id}-${raw.symbol}-${raw.posted_at}`)}`;
+  }
+
+  if (raw.provider === "SEBI") {
+    return `doc_${stableHash(`${raw.provider}-${raw.filing_no}-${raw.symbol}-${raw.filed_on}`)}`;
+  }
+
+  return `doc_${stableHash(JSON.stringify(raw))}`;
+}
+
+function normalizeYearLabel(value) {
+  return `${value || ""}`.trim().toUpperCase();
+}
+
+function normalizeChatDocument(raw) {
+  const title = inferTitle(raw);
+  const description = inferDescription(raw);
+  const quarter = inferQuarter(raw);
+  const fiscalYear = inferFiscalYear(raw);
+  const publishedAt = inferPublishedAt(raw);
+  const sourceUrl = inferSourceUrl(raw);
+  const fileUrl = inferFileUrl(raw);
+
+  return {
+    id: inferNormalizedId(raw),
+    symbol: inferSymbol(raw),
+    company_name: inferCompanyName(raw),
+    title,
+    description,
+    quarter,
+    fiscal_year: fiscalYear,
+    published_at: publishedAt,
+    doc_type: inferDocumentType(raw),
+    source_name: inferSourceName(raw),
+    source_url: sourceUrl,
+    file_url: fileUrl,
+    search_blob: `${title} ${description} ${inferSearchText(raw)}`.toLowerCase(),
+  };
+}
+
+function extractFiscalYearScore(value) {
+  const match = `${value || ""}`.match(/FY\s*(\d{2,4})/i);
+  if (!match?.[1]) {
+    return null;
+  }
+
+  let year = Number(match[1]);
+  if (!Number.isFinite(year)) {
+    return null;
+  }
+  if (year < 100) {
+    year += 2000;
+  }
+  return year;
+}
+
+function matchesYearFilter(document, yearFilter) {
+  if (!yearFilter) {
+    return true;
+  }
+
+  const normalizedFilter = normalizeYearLabel(yearFilter);
+  if (!normalizedFilter || normalizedFilter === "ALL") {
+    return true;
+  }
+
+  const normalizedFiscalYear = normalizeYearLabel(document.fiscal_year);
+  if (normalizedFiscalYear && normalizedFiscalYear.includes(normalizedFilter)) {
+    return true;
+  }
+
+  const fiscalScore = extractFiscalYearScore(normalizedFilter);
+  const documentFiscalScore = extractFiscalYearScore(normalizedFiscalYear);
+  if (fiscalScore && documentFiscalScore && fiscalScore === documentFiscalScore) {
+    return true;
+  }
+
+  const published = new Date(document.published_at);
+  if (!Number.isNaN(published.getTime())) {
+    const publishedYear = `${published.getFullYear()}`;
+    if (normalizedFilter.includes(publishedYear) || publishedYear.includes(normalizedFilter)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function tokenize(text) {
+  return `${text || ""}`
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+}
+
+function scoreDocument(document, options) {
+  const {
+    keywords,
+    selectedQuarter,
+    selectedManagementTopic,
+    selectedFilingTopic,
+    isSummaryRequest,
+  } = options;
+
+  let score = 0;
+
+  for (const keyword of keywords) {
+    if (document.search_blob.includes(keyword)) {
+      score += 2;
+    }
+  }
+
+  if (keywords.length === 0) {
+    score += 1;
+  }
+
+  if (selectedQuarter && document.doc_type === "QUARTERLY_RESULT") {
+    const quarter = normalizeYearLabel(document.quarter);
+    if (quarter === selectedQuarter) {
+      score += 7;
+    } else if (quarter.length > 0) {
+      score -= 1;
+    }
+  }
+
+  if (selectedManagementTopic && document.title.toLowerCase().includes(selectedManagementTopic)) {
+    score += 5;
+  }
+
+  if (selectedFilingTopic && document.title.toLowerCase().includes(selectedFilingTopic)) {
+    score += 5;
+  }
+
+  if (document.doc_type === "QUARTERLY_RESULT") {
+    score += 1;
+  }
+
+  if (document.doc_type === "CONCALL_TRANSCRIPT" || document.doc_type === "ANNOUNCEMENT") {
+    score += 1;
+  }
+
+  if (isSummaryRequest && (document.doc_type === "DRHP" || document.doc_type === "RHP" || document.doc_type === "OFFER_DOCUMENT")) {
+    score += 1;
+  }
+
+  return score;
+}
+
+function rankDocuments(documents, options) {
+  return [...documents]
+    .map((document) => ({
+      document,
+      score: scoreDocument(document, options),
+    }))
+    .sort((left, right) => {
+      const scoreDiff = right.score - left.score;
+      if (scoreDiff !== 0) {
+        return scoreDiff;
+      }
+
+      const leftTs = new Date(left.document.published_at).getTime();
+      const rightTs = new Date(right.document.published_at).getTime();
+      return rightTs - leftTs;
+    })
+    .map((item) => item.document);
+}
+
+function uniqueSources(documents, limit = 8) {
+  const map = new Map();
+
+  for (const document of documents) {
+    const key = `${document.title}-${document.source_url || document.file_url || ""}`;
+    if (map.has(key)) {
+      continue;
+    }
+
+    map.set(key, {
+      title: document.title,
+      url: document.source_url || document.file_url || "",
+      source_name: document.source_name,
+      published_at: document.published_at,
+    });
+
+    if (map.size >= limit) {
+      break;
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+function summarizeDocumentLine(document) {
+  const quarterPart = document.quarter ? ` | ${document.quarter}` : "";
+  const yearPart = document.fiscal_year ? ` | ${document.fiscal_year}` : "";
+  const description = document.description ? ` | ${document.description}` : "";
+  return `${document.title} (${document.doc_type}${quarterPart}${yearPart})${description}`;
+}
+
+function extractMetricSignals(documents) {
+  const signals = [];
+
+  for (const document of documents) {
+    const text = `${document.title} ${document.description}`.toLowerCase();
+    const numberMatches = text.match(/-?\d+(?:,\d{3})*(?:\.\d+)?/g);
+
+    if (!numberMatches || numberMatches.length === 0) {
+      continue;
+    }
+
+    if (text.includes("revenue")) {
+      signals.push(`Revenue references found in "${document.title}" (${numberMatches.slice(0, 2).join(", ")}).`);
+    }
+
+    if (text.includes("pat") || text.includes("profit")) {
+      signals.push(`Profit/PAT references found in "${document.title}" (${numberMatches.slice(0, 2).join(", ")}).`);
+    }
+
+    if (text.includes("margin")) {
+      signals.push(`Margin commentary appears in "${document.title}".`);
+    }
+
+    if (signals.length >= 5) {
+      break;
+    }
+  }
+
+  return signals;
+}
+
+function buildDefaultAnswer({ companyName, symbol, question, documents }) {
+  const scopeSummary = documents.slice(0, 4).map((document, index) => `${index + 1}. ${summarizeDocumentLine(document)}`);
+
+  return [
+    `I analyzed the most relevant filings for ${companyName || symbol} using a retrieval-first approach.`,
+    `Question asked: "${question}"`,
+    "",
+    "Key extracted points:",
+    ...scopeSummary,
+    "",
+    "Interpretation:",
+    "The available filings indicate where management focus and reported updates are concentrated. For deeper confidence, always cross-check full filings and track updates across multiple quarters.",
+  ].join("\n");
+}
+
+function buildSummaryAnswer({ companyName, symbol, documents, year, quarter }) {
+  const scopeLineParts = [];
+  if (year) {
+    scopeLineParts.push(`year filter: ${year}`);
+  }
+  if (quarter) {
+    scopeLineParts.push(`quarter filter: ${quarter}`);
+  }
+  const scopeLine = scopeLineParts.length > 0 ? scopeLineParts.join(", ") : "all available periods";
+
+  const topLines = documents.slice(0, 6).map((document, index) => `${index + 1}. ${summarizeDocumentLine(document)}`);
+  const metricSignals = extractMetricSignals(documents);
+  const metricsSection =
+    metricSignals.length > 0 ? metricSignals.map((line) => `- ${line}`) : ["- Explicit numeric detail is limited in the retrieved snippets; rely on full result PDFs for exact values."];
+
+  return [
+    `Point-by-point deep analysis (${companyName || symbol}, scope: ${scopeLine})`,
+    "Value-add details: tie each claim to a specific filing type and period.",
+    "Helpful depth: focus on trend direction and management consistency across quarters, not isolated one-off prints.",
+    "Often ignored but important: contradictions between announcement tone and detailed filing disclosures.",
+    "",
+    "Business model breakdown",
+    "Value-add details: identify revenue engines, cost drivers, and what management calls out as strategic priorities.",
+    "Helpful depth: explain how each business segment can affect operating leverage and cash conversion.",
+    "Often ignored but important: concentration risk by segment, geography, or regulatory dependency.",
+    "",
+    "Key financial metrics and what they indicate",
+    ...metricsSection,
+    "Value-add details: connect revenue/profit/margin commentary to quarter-over-quarter direction.",
+    "Helpful depth: include enough context to explain direction, avoid overloading with line-item accounting trivia.",
+    "Often ignored but important: whether improvements come from sustainable operations or temporary factors.",
+    "",
+    "Management commentary -> numbers -> long-term implications",
+    "Value-add details: check if commentary about growth, margins, and discipline is visible in disclosed numbers.",
+    "Helpful depth: map management statements to 2-3 measurable monitorables over future quarters.",
+    "Often ignored but important: repeated guidance drift, softened language, or delayed target timelines.",
+    "",
+    "Risks, red flags, and consistency checks",
+    "Value-add details: flag leverage, execution, regulation, and competitive pressure where mentioned.",
+    "Helpful depth: prioritize risk by probability and potential impact; avoid a generic risk laundry list.",
+    "Often ignored but important: disclosures that quietly mention dependency, concentration, or policy sensitivity.",
+    "",
+    "Which points/sections should absolutely be included",
+    "Value-add details: business model, core metrics trend, management-vs-numbers check, risks, and monitorables.",
+    "Helpful depth: keep each section grounded in filing evidence with plain-language interpretation.",
+    "Often ignored but important: what is still unknown and what new disclosures would invalidate the thesis.",
+    "",
+    "Evidence used:",
+    ...topLines,
+  ].join("\n");
+}
+
+function buildFollowUpQuestions({ companyName, year, quarter, topDocuments }) {
+  const periodLabel = quarter || year || "the latest period";
+  const suggested = [
+    `Compare ${periodLabel} with the prior period and explain what changed meaningfully.`,
+    "Which management claims are strongly backed by filed numbers, and which are still assumptions?",
+    "What are the top 3 risks that could break this thesis over the next 12 months?",
+    "What monitorables should I track every quarter before revising the stock story?",
+  ];
+
+  const hasConcall = topDocuments.some((document) => document.doc_type === "CONCALL_TRANSCRIPT");
+  const hasFiling = topDocuments.some(
+    (document) => document.doc_type === "DRHP" || document.doc_type === "RHP" || document.doc_type === "OFFER_DOCUMENT"
+  );
+
+  if (hasConcall) {
+    suggested.push("From concall commentary, what should I verify in the next results release?");
+  }
+
+  if (hasFiling) {
+    suggested.push("Which risk factors from filings still look under-discussed by the market?");
+  }
+
+  if (companyName) {
+    suggested.push(`If I only track 5 things for ${companyName}, what should they be?`);
+  }
+
+  return Array.from(new Set(suggested)).slice(0, 6);
+}
+
+function parseOpenAiOutput(data) {
+  if (typeof data.output_text === "string" && data.output_text.trim().length > 0) {
+    return data.output_text.trim();
+  }
+
+  const flattened = (data.output || [])
+    .flatMap((item) => item.content || [])
+    .filter((item) => item.type === "output_text" && typeof item.text === "string")
+    .map((item) => item.text.trim())
+    .filter((text) => text.length > 0);
+
+  return flattened.length > 0 ? flattened.join("\n").trim() : null;
+}
+
+async function answerWithOpenAi({ question, companyName, symbol, documents, history, isSummaryRequest }) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("LLM is not configured. Set OPENAI_API_KEY on the backend.");
+  }
+
+  if (documents.length === 0) {
+    return null;
+  }
+
+  const contextLines = documents.map((document, index) => {
+    const quarterLine = document.quarter ? `Quarter: ${document.quarter}` : "Quarter: n/a";
+    const yearLine = document.fiscal_year ? `Fiscal year: ${document.fiscal_year}` : "Fiscal year: n/a";
+    return [
+      `[${index + 1}] ${document.title}`,
+      `Type: ${document.doc_type}`,
+      quarterLine,
+      yearLine,
+      `Published: ${document.published_at}`,
+      `Source: ${document.source_name}`,
+      `Summary: ${document.description || "No summary available."}`,
+    ].join("\n");
+  });
+
+  const summaryInstruction = isSummaryRequest
+    ? [
+        "When the user asks for a summary, you MUST use these sections in order:",
+        "1. Point-by-point deep analysis",
+        "2. Business model breakdown",
+        "3. Key financial metrics and what they indicate",
+        "4. Management commentary -> numbers -> long-term implications",
+        "5. Risks, red flags, and consistency checks",
+        "6. Which points/sections should absolutely be included",
+        "Inside each section, explicitly include:",
+        "- What details/interpretations add value",
+        "- What level of depth is useful vs unnecessary",
+        "- What usually gets ignored but should not be ignored",
+      ].join("\n")
+    : "Answer in concise, beginner-friendly language and cite context snippets like [1], [2].";
+
+  const recentHistory = history
+    .slice(-6)
+    .map((turn) => `${turn.role.toUpperCase()}: ${turn.content}`)
+    .join("\n");
+
+  const payload = {
+    model: OPENAI_MODEL || "gpt-4.1-mini",
+    input: [
+      {
+        role: "system",
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "You are Groww AI for beginner investors.",
+              "Use only the provided filing context.",
+              "If data is missing, clearly say it is not available in retrieved documents.",
+              "Do not provide buy/sell recommendations.",
+              summaryInstruction,
+            ].join("\n"),
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: [
+              `Company: ${companyName || symbol}`,
+              `Symbol: ${symbol}`,
+              `Conversation context:\n${recentHistory || "No prior turns."}`,
+              `Question: ${question}`,
+              "Retrieved filing snippets:",
+              contextLines.join("\n\n"),
+            ].join("\n\n"),
+          },
+        ],
+      },
+    ],
+    temperature: 0.2,
+  };
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    const trimmedError = errorText.trim();
+    throw new Error(
+      trimmedError
+        ? `LLM request failed (${response.status}): ${trimmedError.slice(0, 220)}`
+        : `LLM request failed with status ${response.status}.`
+    );
+  }
+
+  const data = await response.json();
+  const parsed = parseOpenAiOutput(data);
+  if (!parsed) {
+    throw new Error("LLM returned an empty answer.");
+  }
+
+  return parsed;
+}
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.get("/api/companies", async (req, res) => {
+  try {
+    const query = `${req.query.query || ""}`.trim().toLowerCase();
+    const rawItems = await loadRawDocuments();
+
+    const companies = buildCompanies(rawItems).filter((company) => {
+      if (!query) {
+        return true;
+      }
+
+      const text = `${company.company_name} ${company.symbol} ${company.isin || ""}`.toLowerCase();
+      return text.includes(query);
+    });
+
+    res.json({ companies });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch companies." });
+  }
+});
+
+app.get("/api/documents", async (req, res) => {
+  try {
+    const symbol = `${req.query.symbol || ""}`.trim().toUpperCase();
+    const docType = `${req.query.doc_type || "ALL"}`.trim();
+    const q = `${req.query.q || ""}`.trim().toLowerCase();
+    const from = `${req.query.from || ""}`.trim();
+    const to = `${req.query.to || ""}`.trim();
+    const sort = `${req.query.sort || "newest"}`.trim();
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.max(1, Number(req.query.page_size || 10));
+
+    if (!symbol) {
+      res.status(400).json({ error: "'symbol' query param is required." });
+      return;
+    }
+
+    const rawItems = await loadRawDocuments(symbol);
+
+    const filtered = rawItems
+      .filter((item) => inferSymbol(item) === symbol)
+      .filter((item) => matchesDocType(item, docType))
+      .filter((item) => withinDateRange(item, from || undefined, to || undefined))
+      .filter((item) => {
+        if (!q) {
+          return true;
+        }
+
+        return inferSearchText(item).includes(q);
+      });
+
+    const sorted = sortRawDocuments(filtered, sort);
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+
+    res.json({
+      items: sorted.slice(start, end),
+      total: sorted.length,
+      page,
+      page_size: pageSize,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch documents." });
+  }
+});
+
+app.post("/api/chat", async (req, res) => {
+  try {
+    const symbol = `${req.body.symbol || ""}`.trim().toUpperCase();
+    const companyName = `${req.body.company_name || ""}`.trim();
+    const question = `${req.body.question || ""}`.trim();
+    const year = `${req.body.year || ""}`.trim();
+    const docIds = Array.isArray(req.body.doc_ids)
+      ? req.body.doc_ids
+          .map((docId) => `${docId || ""}`.trim())
+          .filter((docId) => docId.length > 0)
+      : [];
+    const quarter = normalizeYearLabel(req.body.quarter || "");
+    const managementFocus = `${req.body.management_focus || ""}`.trim().toLowerCase();
+    const filingsFocus = `${req.body.filings_focus || ""}`.trim().toLowerCase();
+    const history = Array.isArray(req.body.history)
+      ? req.body.history
+          .slice(-10)
+          .map((turn) => ({
+            role: turn?.role === "assistant" ? "assistant" : "user",
+            content: `${turn?.content || ""}`.trim(),
+          }))
+          .filter((turn) => turn.content.length > 0)
+      : [];
+
+    if (!symbol) {
+      res.status(400).json({ error: "'symbol' is required." });
+      return;
+    }
+
+    if (!question) {
+      res.status(400).json({ error: "'question' is required." });
+      return;
+    }
+
+    if (!OPENAI_API_KEY) {
+      res.status(500).json({
+        error: "LLM is not configured. Add OPENAI_API_KEY in backend environment variables.",
+      });
+      return;
+    }
+
+    const rawItems = await loadRawDocuments(symbol);
+    const normalized = rawItems
+      .filter((item) => inferSymbol(item) === symbol)
+      .map((item) => normalizeChatDocument(item));
+
+    if (normalized.length === 0) {
+      res.json({
+        answer: `I could not find filings for ${symbol}. Try another symbol or remove filters.`,
+        sources: [],
+        follow_up_questions: [
+          "Try a broader query without period filters.",
+          "Ask for a business model overview after selecting a symbol with filings.",
+        ],
+      });
+      return;
+    }
+
+    const scopedByYear = normalized.filter((document) => matchesYearFilter(document, year));
+    const activeDocuments = scopedByYear.length > 0 ? scopedByYear : normalized;
+    const scopedByDocIds =
+      docIds.length > 0 ? activeDocuments.filter((document) => docIds.includes(document.id)) : activeDocuments;
+    const retrievalPool = scopedByDocIds.length > 0 ? scopedByDocIds : activeDocuments;
+
+    const isSummaryRequest = SUMMARY_REGEX.test(question);
+    const ranked = rankDocuments(retrievalPool, {
+      keywords: tokenize(question),
+      selectedQuarter: quarter,
+      selectedManagementTopic: managementFocus,
+      selectedFilingTopic: filingsFocus,
+      isSummaryRequest,
+    });
+
+    const topDocuments = ranked.slice(0, 8);
+    const contextDocuments = topDocuments.length > 0 ? topDocuments : retrievalPool.slice(0, 8);
+
+    const finalCompanyName = companyName || contextDocuments[0]?.company_name || symbol;
+
+    let answer;
+    try {
+      answer = await answerWithOpenAi({
+        question,
+        companyName: finalCompanyName,
+        symbol,
+        documents: contextDocuments,
+        history,
+        isSummaryRequest,
+      });
+    } catch (error) {
+      res.status(502).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : "LLM request failed while answering this query.",
+      });
+      return;
+    }
+
+    if (!answer) {
+      answer = isSummaryRequest
+        ? buildSummaryAnswer({
+            companyName: finalCompanyName,
+            symbol,
+            documents: contextDocuments,
+            year,
+            quarter,
+          })
+        : buildDefaultAnswer({
+            companyName: finalCompanyName,
+            symbol,
+            question,
+            documents: contextDocuments,
+          });
+    }
+
+    const sources = uniqueSources(contextDocuments, 8);
+    const followUpQuestions = buildFollowUpQuestions({
+      companyName: finalCompanyName,
+      year,
+      quarter,
+      topDocuments: contextDocuments,
+    });
+
+    res.json({
+      answer,
+      sources,
+      follow_up_questions: followUpQuestions,
+      meta: {
+        model_used: OPENAI_API_KEY ? OPENAI_MODEL : "fallback-rag",
+        retrieved_documents: contextDocuments.length,
+        doc_scope_requested: docIds.length > 0,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to answer chat query." });
+  }
+});
+
+if (HAS_DIST) {
+  app.use(express.static(DIST_DIR));
+
+  app.use((req, res, next) => {
+    if (req.method !== "GET" || req.path.startsWith("/api/")) {
+      next();
+      return;
+    }
+
+    res.sendFile(DIST_INDEX_FILE);
+  });
+}
+
+app.listen(PORT, () => {
+  console.log(`Documents API server running on http://localhost:${PORT}`);
+});
