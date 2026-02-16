@@ -33,6 +33,10 @@ const {
 } = require("./db/ragStore.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
+const OLLAMA_BASE_URL = `${process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434"}`.trim().replace(/\/$/, "");
+const OLLAMA_MODEL = `${process.env.OLLAMA_MODEL || ""}`.trim();
+const OLLAMA_EMBEDDING_MODEL = `${process.env.OLLAMA_EMBEDDING_MODEL || ""}`.trim();
+const OLLAMA_TIMEOUT_MS = Math.max(3000, Math.min(Number(process.env.OLLAMA_TIMEOUT_MS || 45000), 180000));
 const XAI_API_KEY = `${process.env.XAI_API_KEY || ""}`.trim();
 const XAI_MODEL = `${process.env.XAI_MODEL || "grok-3-mini"}`.trim();
 const XAI_EMBEDDING_MODEL = `${process.env.XAI_EMBEDDING_MODEL || ""}`.trim();
@@ -58,24 +62,29 @@ const RAG_EMBEDDING_INPUT_CHARS = Math.max(200, Math.min(Number(process.env.RAG_
 const pdfTextCache = new Map();
 const ragIngestionInFlight = new Set();
 
+const HAS_OLLAMA_CHAT = Boolean(OLLAMA_BASE_URL && OLLAMA_MODEL);
 const HAS_XAI_CHAT = Boolean(XAI_API_KEY);
 const HAS_GEMINI_CHAT = Boolean(GEMINI_API_KEY);
+const HAS_OLLAMA_EMBEDDINGS = Boolean(OLLAMA_BASE_URL && OLLAMA_EMBEDDING_MODEL);
 const HAS_XAI_EMBEDDINGS = Boolean(XAI_API_KEY && XAI_EMBEDDING_MODEL);
 const HAS_GEMINI_EMBEDDINGS = Boolean(GEMINI_API_KEY && GEMINI_EMBEDDING_MODEL);
 
 app.use(cors());
 app.use(express.json());
 
-if (hasRagDatabase() && (HAS_XAI_CHAT || HAS_GEMINI_CHAT)) {
+if (hasRagDatabase() && (HAS_OLLAMA_CHAT || HAS_GEMINI_CHAT || HAS_XAI_CHAT)) {
   void ensureRagSchema();
 }
 
 function getDefaultModelUsed() {
-  if (HAS_XAI_CHAT) {
-    return XAI_MODEL;
+  if (HAS_OLLAMA_CHAT) {
+    return `ollama:${OLLAMA_MODEL}`;
   }
   if (HAS_GEMINI_CHAT) {
     return GEMINI_MODEL;
+  }
+  if (HAS_XAI_CHAT) {
+    return XAI_MODEL;
   }
   return "unconfigured";
 }
@@ -92,28 +101,58 @@ function createProviderRequestError(provider, status, rawText) {
   return error;
 }
 
-function shouldFallbackToGemini(error) {
-  if (!HAS_GEMINI_CHAT) {
-    return false;
+function shouldFallbackToNextProvider(error) {
+  if (!error) {
+    return true;
   }
-  if (!error || error.provider !== "xai") {
-    return false;
+
+  if (!error.provider) {
+    return true;
   }
 
   const status = Number(error.status);
-  if ([401, 402, 403, 429, 500, 502, 503, 504].includes(status)) {
+  if ([400, 401, 402, 403, 404, 408, 409, 413, 415, 422, 429, 500, 502, 503, 504].includes(status)) {
     return true;
   }
 
   const detail = `${error.body || error.message || ""}`.toLowerCase();
-  return (
+  if (
     detail.includes("credit") ||
     detail.includes("license") ||
     detail.includes("permission") ||
     detail.includes("quota") ||
     detail.includes("rate limit") ||
-    detail.includes("exceeded")
-  );
+    detail.includes("exceeded") ||
+    detail.includes("timeout") ||
+    detail.includes("connection") ||
+    detail.includes("network")
+  ) {
+    return true;
+  }
+
+  if (error.provider === "xai") {
+    return HAS_GEMINI_CHAT || HAS_OLLAMA_CHAT;
+  }
+  if (error.provider === "gemini") {
+    return HAS_XAI_CHAT;
+  }
+  if (error.provider === "ollama") {
+    return HAS_GEMINI_CHAT || HAS_XAI_CHAT;
+  }
+
+  return false;
+}
+
+function shouldFallbackToLexical(error) {
+  if (!error) {
+    return false;
+  }
+
+  if (!error.provider) {
+    return true;
+  }
+
+  return shouldFallbackToNextProvider(error);
 }
 
 function toInternalDocTypeFilter(rawValue) {
@@ -596,6 +635,82 @@ function createRagChunkId(document, chunkIndex, chunkText) {
   )}`;
 }
 
+async function requestOllama(pathname, payload) {
+  if (!OLLAMA_BASE_URL) {
+    throw new Error("Ollama base URL is not configured.");
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${OLLAMA_BASE_URL}${pathname}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const reason = await response.text().catch(() => "");
+      throw createProviderRequestError("ollama", response.status, reason.slice(0, 500));
+    }
+
+    return response.json();
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw createProviderRequestError("ollama", 408, "Ollama request timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function requestOllamaEmbedding(text) {
+  if (!HAS_OLLAMA_EMBEDDINGS) {
+    return [];
+  }
+
+  const prompt = `${text || ""}`.trim();
+  if (!prompt) {
+    return [];
+  }
+
+  const input = prompt.slice(0, RAG_EMBEDDING_INPUT_CHARS);
+
+  try {
+    const data = await requestOllama("/api/embed", {
+      model: OLLAMA_EMBEDDING_MODEL,
+      input,
+    });
+
+    const fromEmbedApi = Array.isArray(data?.embeddings?.[0]) ? data.embeddings[0] : [];
+    if (Array.isArray(fromEmbedApi) && fromEmbedApi.length > 0) {
+      return alignEmbeddingDimension(fromEmbedApi);
+    }
+  } catch (error) {
+    const status = Number(error?.status);
+    const shouldTryLegacyEndpoint = status === 400 || status === 404 || status === 405;
+    if (!shouldTryLegacyEndpoint) {
+      throw error;
+    }
+  }
+
+  const fallbackData = await requestOllama("/api/embeddings", {
+    model: OLLAMA_EMBEDDING_MODEL,
+    prompt: input,
+  });
+  const fromLegacyApi = Array.isArray(fallbackData?.embedding) ? fallbackData.embedding : [];
+  if (!Array.isArray(fromLegacyApi) || fromLegacyApi.length === 0) {
+    return [];
+  }
+
+  return alignEmbeddingDimension(fromLegacyApi);
+}
+
 async function requestXaiEmbedding(text, _taskType) {
   if (!HAS_XAI_EMBEDDINGS) {
     return [];
@@ -685,25 +800,43 @@ async function requestEmbeddingWithFallback(text, taskType) {
     return [];
   }
 
-  let xaiError = null;
+  let lastError = null;
 
-  if (HAS_XAI_EMBEDDINGS) {
+  if (HAS_OLLAMA_EMBEDDINGS) {
     try {
-      return await requestXaiEmbedding(prompt, taskType);
+      return await requestOllamaEmbedding(prompt);
     } catch (error) {
-      xaiError = error;
-      if (!shouldFallbackToGemini(error)) {
+      lastError = error;
+      if (!shouldFallbackToNextProvider(error)) {
         throw error;
       }
     }
   }
 
   if (HAS_GEMINI_EMBEDDINGS) {
-    return requestGeminiEmbedding(prompt, taskType);
+    try {
+      return await requestGeminiEmbedding(prompt, taskType);
+    } catch (error) {
+      lastError = error;
+      if (!shouldFallbackToNextProvider(error)) {
+        throw error;
+      }
+    }
   }
 
-  if (xaiError) {
-    throw xaiError;
+  if (HAS_XAI_EMBEDDINGS) {
+    try {
+      return await requestXaiEmbedding(prompt, taskType);
+    } catch (error) {
+      lastError = error;
+      if (!shouldFallbackToNextProvider(error)) {
+        throw error;
+      }
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
   }
 
   return [];
@@ -846,7 +979,7 @@ async function retrieveRagChunksForQuestion(options = {}) {
     return [];
   }
 
-  if (HAS_XAI_EMBEDDINGS || HAS_GEMINI_EMBEDDINGS) {
+  if (HAS_OLLAMA_EMBEDDINGS || HAS_GEMINI_EMBEDDINGS || HAS_XAI_EMBEDDINGS) {
     let queryEmbedding;
     try {
       queryEmbedding = await requestEmbeddingWithFallback(question, "RETRIEVAL_QUERY");
@@ -1267,6 +1400,10 @@ function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }
 }
 
 function parseLlmOutput(data) {
+  if (typeof data?.message?.content === "string" && data.message.content.trim().length > 0) {
+    return data.message.content.trim();
+  }
+
   const choices = Array.isArray(data?.choices) ? data.choices : [];
   for (const choice of choices) {
     const message = choice?.message;
@@ -1374,6 +1511,15 @@ function buildXaiHistory(history) {
     }));
 }
 
+function buildOllamaHistory(history) {
+  return history
+    .slice(-6)
+    .map((turn) => ({
+      role: turn.role === "assistant" ? "assistant" : "user",
+      content: turn.content,
+    }));
+}
+
 function buildGeminiHistory(history) {
   return history
     .slice(-6)
@@ -1404,6 +1550,32 @@ async function requestXaiChatCompletion(payload) {
   }
 
   return response.json();
+}
+
+async function requestOllamaChatCompletion({
+  systemPrompt,
+  history = [],
+  userPrompt,
+  temperature = 0.2,
+  responseMimeType,
+}) {
+  if (!HAS_OLLAMA_CHAT) {
+    throw new Error("Ollama chat provider is not configured.");
+  }
+
+  return requestOllama("/api/chat", {
+    model: OLLAMA_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...buildOllamaHistory(history),
+      { role: "user", content: userPrompt },
+    ],
+    stream: false,
+    options: {
+      temperature,
+    },
+    ...(responseMimeType === "application/json" ? { format: "json" } : {}),
+  });
 }
 
 async function requestGeminiChatCompletion({
@@ -1455,7 +1627,59 @@ async function requestChatCompletionWithFallback({
   temperature = 0.2,
   responseMimeType,
 }) {
-  let xaiError = null;
+  let lastError = null;
+
+  if (HAS_OLLAMA_CHAT) {
+    try {
+      const ollamaData = await requestOllamaChatCompletion({
+        systemPrompt,
+        history,
+        userPrompt,
+        temperature,
+        responseMimeType,
+      });
+      const text = parseLlmOutput(ollamaData);
+      if (!text) {
+        throw createProviderRequestError("ollama", 502, "Ollama returned an empty answer.");
+      }
+      return {
+        text,
+        provider: "ollama",
+        modelUsed: `ollama:${ollamaData?.model || OLLAMA_MODEL}`,
+      };
+    } catch (error) {
+      lastError = error;
+      if (!shouldFallbackToNextProvider(error)) {
+        throw error;
+      }
+    }
+  }
+
+  if (HAS_GEMINI_CHAT) {
+    try {
+      const geminiData = await requestGeminiChatCompletion({
+        systemPrompt,
+        history,
+        userPrompt,
+        temperature,
+        responseMimeType,
+      });
+      const text = parseLlmOutput(geminiData);
+      if (!text) {
+        throw createProviderRequestError("gemini", 502, "Gemini returned an empty answer.");
+      }
+      return {
+        text,
+        provider: "gemini",
+        modelUsed: GEMINI_MODEL,
+      };
+    } catch (error) {
+      lastError = error;
+      if (!shouldFallbackToNextProvider(error)) {
+        throw error;
+      }
+    }
+  }
 
   if (HAS_XAI_CHAT) {
     try {
@@ -1470,7 +1694,7 @@ async function requestChatCompletionWithFallback({
       });
       const text = parseLlmOutput(xaiData);
       if (!text) {
-        throw new Error("LLM returned an empty answer.");
+        throw createProviderRequestError("xai", 502, "xAI returned an empty answer.");
       }
       return {
         text,
@@ -1478,42 +1702,23 @@ async function requestChatCompletionWithFallback({
         modelUsed: XAI_MODEL,
       };
     } catch (error) {
-      xaiError = error;
-      if (!shouldFallbackToGemini(error)) {
+      lastError = error;
+      if (!shouldFallbackToNextProvider(error)) {
         throw error;
       }
     }
   }
 
-  if (HAS_GEMINI_CHAT) {
-    const geminiData = await requestGeminiChatCompletion({
-      systemPrompt,
-      history,
-      userPrompt,
-      temperature,
-      responseMimeType,
-    });
-    const text = parseLlmOutput(geminiData);
-    if (!text) {
-      throw new Error("LLM returned an empty answer.");
-    }
-    return {
-      text,
-      provider: "gemini",
-      modelUsed: GEMINI_MODEL,
-    };
+  if (lastError) {
+    throw lastError;
   }
 
-  if (xaiError) {
-    throw xaiError;
-  }
-
-  throw new Error("LLM is not configured. Set XAI_API_KEY or GEMINI_API_KEY.");
+  throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY.");
 }
 
 async function answerWithGrok({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
-  if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
-    throw new Error("LLM is not configured. Set XAI_API_KEY or GEMINI_API_KEY on the backend.");
+  if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
+    throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY on the backend.");
   }
 
   if (documents.length === 0) {
@@ -1590,8 +1795,8 @@ async function generateSummaryCardsWithGrok({
   swipeDirection,
   currentCard,
 }) {
-  if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
-    throw new Error("LLM is not configured. Set XAI_API_KEY or GEMINI_API_KEY on the backend.");
+  if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
+    throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY on the backend.");
   }
 
   const docContextLines = buildContextLines(documents).join("\n\n");
@@ -1759,7 +1964,7 @@ app.get("/api/documents", async (req, res) => {
     const start = (page - 1) * pageSize;
     const end = start + pageSize;
 
-    if (hasRagDatabase() && (HAS_XAI_CHAT || HAS_GEMINI_CHAT)) {
+    if (hasRagDatabase() && (HAS_OLLAMA_CHAT || HAS_GEMINI_CHAT || HAS_XAI_CHAT)) {
       const preloadDocuments = sorted.slice(0, RAG_INGEST_PRELOAD_LIMIT).map((item) => normalizeChatDocument(item));
       void ensureRagCoverage(preloadDocuments, { blockingCount: 0 });
     }
@@ -1791,8 +1996,8 @@ app.post("/api/rag/ingest", async (req, res) => {
       return;
     }
 
-    if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
-      res.status(400).json({ error: "Set XAI_API_KEY or GEMINI_API_KEY for RAG ingestion." });
+    if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
+      res.status(400).json({ error: "Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY for RAG ingestion." });
       return;
     }
 
@@ -1875,9 +2080,9 @@ app.post("/api/chat", async (req, res) => {
       return;
     }
 
-    if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
+    if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
       res.status(500).json({
-        error: "LLM is not configured. Add XAI_API_KEY or GEMINI_API_KEY in backend environment variables.",
+        error: "LLM is not configured. Add OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY in backend environment variables.",
       });
       return;
     }
