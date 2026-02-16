@@ -36,6 +36,9 @@ const PORT = Number(process.env.PORT || 8787);
 const XAI_API_KEY = `${process.env.XAI_API_KEY || ""}`.trim();
 const XAI_MODEL = `${process.env.XAI_MODEL || "grok-3-mini"}`.trim();
 const XAI_EMBEDDING_MODEL = `${process.env.XAI_EMBEDDING_MODEL || ""}`.trim();
+const GEMINI_API_KEY = `${process.env.GEMINI_API_KEY || ""}`.trim();
+const GEMINI_MODEL = `${process.env.GEMINI_MODEL || "gemini-2.5-flash"}`.trim();
+const GEMINI_EMBEDDING_MODEL = `${process.env.GEMINI_EMBEDDING_MODEL || "text-embedding-004"}`.trim();
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
 const DIST_INDEX_FILE = path.join(DIST_DIR, "index.html");
 const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
@@ -55,11 +58,62 @@ const RAG_EMBEDDING_INPUT_CHARS = Math.max(200, Math.min(Number(process.env.RAG_
 const pdfTextCache = new Map();
 const ragIngestionInFlight = new Set();
 
+const HAS_XAI_CHAT = Boolean(XAI_API_KEY);
+const HAS_GEMINI_CHAT = Boolean(GEMINI_API_KEY);
+const HAS_XAI_EMBEDDINGS = Boolean(XAI_API_KEY && XAI_EMBEDDING_MODEL);
+const HAS_GEMINI_EMBEDDINGS = Boolean(GEMINI_API_KEY && GEMINI_EMBEDDING_MODEL);
+
 app.use(cors());
 app.use(express.json());
 
-if (hasRagDatabase() && XAI_API_KEY) {
+if (hasRagDatabase() && (HAS_XAI_CHAT || HAS_GEMINI_CHAT)) {
   void ensureRagSchema();
+}
+
+function getDefaultModelUsed() {
+  if (HAS_XAI_CHAT) {
+    return XAI_MODEL;
+  }
+  if (HAS_GEMINI_CHAT) {
+    return GEMINI_MODEL;
+  }
+  return "unconfigured";
+}
+
+function createProviderRequestError(provider, status, rawText) {
+  const body = `${rawText || ""}`.trim();
+  const message = body
+    ? `LLM request failed (${status}): ${body.slice(0, 220)}`
+    : `LLM request failed with status ${status}.`;
+  const error = new Error(message);
+  error.provider = provider;
+  error.status = status;
+  error.body = body;
+  return error;
+}
+
+function shouldFallbackToGemini(error) {
+  if (!HAS_GEMINI_CHAT) {
+    return false;
+  }
+  if (!error || error.provider !== "xai") {
+    return false;
+  }
+
+  const status = Number(error.status);
+  if ([401, 402, 403, 429, 500, 502, 503, 504].includes(status)) {
+    return true;
+  }
+
+  const detail = `${error.body || error.message || ""}`.toLowerCase();
+  return (
+    detail.includes("credit") ||
+    detail.includes("license") ||
+    detail.includes("permission") ||
+    detail.includes("quota") ||
+    detail.includes("rate limit") ||
+    detail.includes("exceeded")
+  );
 }
 
 function toInternalDocTypeFilter(rawValue) {
@@ -543,7 +597,7 @@ function createRagChunkId(document, chunkIndex, chunkText) {
 }
 
 async function requestXaiEmbedding(text, _taskType) {
-  if (!XAI_API_KEY || !XAI_EMBEDDING_MODEL) {
+  if (!HAS_XAI_EMBEDDINGS) {
     return [];
   }
 
@@ -568,7 +622,7 @@ async function requestXaiEmbedding(text, _taskType) {
 
   if (!response.ok) {
     const reason = await response.text().catch(() => "");
-    throw new Error(`Embedding request failed (${response.status}): ${reason.slice(0, 180)}`);
+    throw createProviderRequestError("xai", response.status, reason.slice(0, 500));
   }
 
   const data = await response.json();
@@ -579,6 +633,80 @@ async function requestXaiEmbedding(text, _taskType) {
   }
 
   return alignEmbeddingDimension(values);
+}
+
+async function requestGeminiEmbedding(text, taskType) {
+  if (!HAS_GEMINI_EMBEDDINGS) {
+    return [];
+  }
+
+  const prompt = `${text || ""}`.trim();
+  if (!prompt) {
+    return [];
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_EMBEDDING_MODEL
+  )}:embedContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      content: {
+        parts: [{ text: prompt.slice(0, RAG_EMBEDDING_INPUT_CHARS) }],
+      },
+      taskType: taskType || "RETRIEVAL_DOCUMENT",
+    }),
+  });
+
+  if (!response.ok) {
+    const reason = await response.text().catch(() => "");
+    throw createProviderRequestError("gemini", response.status, reason.slice(0, 500));
+  }
+
+  const data = await response.json();
+  const valuesFromSingle = Array.isArray(data?.embedding?.values) ? data.embedding.values : [];
+  const valuesFromBatch = Array.isArray(data?.embeddings?.[0]?.values) ? data.embeddings[0].values : [];
+  const values = valuesFromSingle.length > 0 ? valuesFromSingle : valuesFromBatch;
+
+  if (!Array.isArray(values) || values.length === 0) {
+    return [];
+  }
+
+  return alignEmbeddingDimension(values);
+}
+
+async function requestEmbeddingWithFallback(text, taskType) {
+  const prompt = `${text || ""}`.trim();
+  if (!prompt) {
+    return [];
+  }
+
+  let xaiError = null;
+
+  if (HAS_XAI_EMBEDDINGS) {
+    try {
+      return await requestXaiEmbedding(prompt, taskType);
+    } catch (error) {
+      xaiError = error;
+      if (!shouldFallbackToGemini(error)) {
+        throw error;
+      }
+    }
+  }
+
+  if (HAS_GEMINI_EMBEDDINGS) {
+    return requestGeminiEmbedding(prompt, taskType);
+  }
+
+  if (xaiError) {
+    throw xaiError;
+  }
+
+  return [];
 }
 
 async function ingestDocumentIntoRag(document) {
@@ -609,12 +737,10 @@ async function ingestDocumentIntoRag(document) {
   for (let index = 0; index < chunks.length; index += 1) {
     const chunkText = chunks[index];
     let embedding = [];
-    if (XAI_EMBEDDING_MODEL && XAI_API_KEY) {
-      try {
-        embedding = await requestXaiEmbedding(chunkText, "RETRIEVAL_DOCUMENT");
-      } catch (error) {
-        console.error("Chunk embedding failed:", error.message);
-      }
+    try {
+      embedding = await requestEmbeddingWithFallback(chunkText, "RETRIEVAL_DOCUMENT");
+    } catch (error) {
+      console.error("Chunk embedding failed:", error.message);
     }
     if (!Array.isArray(embedding) || embedding.length === 0) {
       embedding = alignEmbeddingDimension([]);
@@ -665,7 +791,7 @@ function queueRagIngestion(document) {
 }
 
 async function ensureRagCoverage(documents, options = {}) {
-  if (!hasRagDatabase() || !XAI_API_KEY) {
+  if (!hasRagDatabase()) {
     return;
   }
 
@@ -711,7 +837,7 @@ async function retrieveRagChunksForQuestion(options = {}) {
     : [];
   const limit = Math.max(2, Math.min(Number(options.limit) || RAG_RETRIEVAL_LIMIT, 20));
 
-  if (!symbol || !question || !hasRagDatabase() || !XAI_API_KEY) {
+  if (!symbol || !question || !hasRagDatabase()) {
     return [];
   }
 
@@ -720,10 +846,10 @@ async function retrieveRagChunksForQuestion(options = {}) {
     return [];
   }
 
-  if (XAI_EMBEDDING_MODEL) {
+  if (HAS_XAI_EMBEDDINGS || HAS_GEMINI_EMBEDDINGS) {
     let queryEmbedding;
     try {
-      queryEmbedding = await requestXaiEmbedding(question, "RETRIEVAL_QUERY");
+      queryEmbedding = await requestEmbeddingWithFallback(question, "RETRIEVAL_QUERY");
     } catch (error) {
       console.error("Query embedding failed:", error.message);
     }
@@ -1248,7 +1374,20 @@ function buildXaiHistory(history) {
     }));
 }
 
+function buildGeminiHistory(history) {
+  return history
+    .slice(-6)
+    .map((turn) => ({
+      role: turn.role === "assistant" ? "model" : "user",
+      parts: [{ text: turn.content }],
+    }));
+}
+
 async function requestXaiChatCompletion(payload) {
+  if (!HAS_XAI_CHAT) {
+    throw new Error("xAI chat provider is not configured.");
+  }
+
   const endpoint = "https://api.x.ai/v1/chat/completions";
   const response = await fetch(endpoint, {
     method: "POST",
@@ -1261,20 +1400,120 @@ async function requestXaiChatCompletion(payload) {
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");
-    const trimmedError = errorText.trim();
-    throw new Error(
-      trimmedError
-        ? `LLM request failed (${response.status}): ${trimmedError.slice(0, 220)}`
-        : `LLM request failed with status ${response.status}.`
-    );
+    throw createProviderRequestError("xai", response.status, errorText.slice(0, 500));
   }
 
   return response.json();
 }
 
+async function requestGeminiChatCompletion({
+  systemPrompt,
+  history = [],
+  userPrompt,
+  temperature = 0.2,
+  responseMimeType,
+}) {
+  if (!HAS_GEMINI_CHAT) {
+    throw new Error("Gemini chat provider is not configured.");
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_MODEL
+  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  const payload = {
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [...buildGeminiHistory(history), { role: "user", parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      temperature,
+      ...(responseMimeType ? { responseMimeType } : {}),
+    },
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw createProviderRequestError("gemini", response.status, errorText.slice(0, 500));
+  }
+
+  return response.json();
+}
+
+async function requestChatCompletionWithFallback({
+  systemPrompt,
+  history = [],
+  userPrompt,
+  temperature = 0.2,
+  responseMimeType,
+}) {
+  let xaiError = null;
+
+  if (HAS_XAI_CHAT) {
+    try {
+      const xaiData = await requestXaiChatCompletion({
+        model: XAI_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...buildXaiHistory(history),
+          { role: "user", content: userPrompt },
+        ],
+        temperature,
+      });
+      const text = parseLlmOutput(xaiData);
+      if (!text) {
+        throw new Error("LLM returned an empty answer.");
+      }
+      return {
+        text,
+        provider: "xai",
+        modelUsed: XAI_MODEL,
+      };
+    } catch (error) {
+      xaiError = error;
+      if (!shouldFallbackToGemini(error)) {
+        throw error;
+      }
+    }
+  }
+
+  if (HAS_GEMINI_CHAT) {
+    const geminiData = await requestGeminiChatCompletion({
+      systemPrompt,
+      history,
+      userPrompt,
+      temperature,
+      responseMimeType,
+    });
+    const text = parseLlmOutput(geminiData);
+    if (!text) {
+      throw new Error("LLM returned an empty answer.");
+    }
+    return {
+      text,
+      provider: "gemini",
+      modelUsed: GEMINI_MODEL,
+    };
+  }
+
+  if (xaiError) {
+    throw xaiError;
+  }
+
+  throw new Error("LLM is not configured. Set XAI_API_KEY or GEMINI_API_KEY.");
+}
+
 async function answerWithGrok({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
-  if (!XAI_API_KEY) {
-    throw new Error("LLM is not configured. Set XAI_API_KEY on the backend.");
+  if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
+    throw new Error("LLM is not configured. Set XAI_API_KEY or GEMINI_API_KEY on the backend.");
   }
 
   if (documents.length === 0) {
@@ -1324,24 +1563,22 @@ async function answerWithGrok({ question, companyName, symbol, documents, histor
     ...evidenceSections,
   ].join("\n\n");
 
-  const payload = {
-    model: XAI_MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      ...buildXaiHistory(history),
-      { role: "user", content: questionPrompt },
-    ],
+  const completion = await requestChatCompletionWithFallback({
+    systemPrompt,
+    history,
+    userPrompt: questionPrompt,
     temperature: 0.2,
-  };
-
-  const data = await requestXaiChatCompletion(payload);
-  const parsed = parseLlmOutput(data);
+  });
+  const parsed = completion.text;
 
   if (!parsed) {
     throw new Error("LLM returned an empty answer.");
   }
 
-  return parsed;
+  return {
+    answer: parsed,
+    modelUsed: completion.modelUsed,
+  };
 }
 
 async function generateSummaryCardsWithGrok({
@@ -1353,8 +1590,8 @@ async function generateSummaryCardsWithGrok({
   swipeDirection,
   currentCard,
 }) {
-  if (!XAI_API_KEY) {
-    throw new Error("LLM is not configured. Set XAI_API_KEY on the backend.");
+  if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
+    throw new Error("LLM is not configured. Set XAI_API_KEY or GEMINI_API_KEY on the backend.");
   }
 
   const docContextLines = buildContextLines(documents).join("\n\n");
@@ -1397,20 +1634,14 @@ async function generateSummaryCardsWithGrok({
           contextLines,
         ].join("\n\n");
 
-  const payload = {
-    model: XAI_MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ],
+  const completion = await requestChatCompletionWithFallback({
+    systemPrompt,
+    history: [],
+    userPrompt,
     temperature: 0.35,
-  };
-
-  const data = await requestXaiChatCompletion(payload);
-  const rawText = parseLlmOutput(data);
+    responseMimeType: "application/json",
+  });
+  const rawText = completion.text;
   const parsedJson = tryParseJson(rawText);
 
   let rawCards = [];
@@ -1429,24 +1660,33 @@ async function generateSummaryCardsWithGrok({
     .filter((value) => Boolean(value));
 
   if (normalizedCards.length > 0) {
-    return normalizedCards;
+    return {
+      cards: normalizedCards,
+      modelUsed: completion.modelUsed,
+    };
   }
 
   if (mode === "summary_cards_init") {
-    return buildFallbackSummaryCardsInit({
-      companyName,
-      symbol,
-      documents,
-    });
+    return {
+      cards: buildFallbackSummaryCardsInit({
+        companyName,
+        symbol,
+        documents,
+      }),
+      modelUsed: completion.modelUsed,
+    };
   }
 
-  return [
-    buildFallbackNextSummaryCard({
-      swipeDirection,
-      currentCard,
-      documents,
-    }),
-  ];
+  return {
+    cards: [
+      buildFallbackNextSummaryCard({
+        swipeDirection,
+        currentCard,
+        documents,
+      }),
+    ],
+    modelUsed: completion.modelUsed,
+  };
 }
 
 app.get("/api/health", (_req, res) => {
@@ -1519,7 +1759,7 @@ app.get("/api/documents", async (req, res) => {
     const start = (page - 1) * pageSize;
     const end = start + pageSize;
 
-    if (hasRagDatabase() && XAI_API_KEY) {
+    if (hasRagDatabase() && (HAS_XAI_CHAT || HAS_GEMINI_CHAT)) {
       const preloadDocuments = sorted.slice(0, RAG_INGEST_PRELOAD_LIMIT).map((item) => normalizeChatDocument(item));
       void ensureRagCoverage(preloadDocuments, { blockingCount: 0 });
     }
@@ -1551,8 +1791,8 @@ app.post("/api/rag/ingest", async (req, res) => {
       return;
     }
 
-    if (!XAI_API_KEY) {
-      res.status(400).json({ error: "XAI_API_KEY is required for RAG ingestion." });
+    if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
+      res.status(400).json({ error: "Set XAI_API_KEY or GEMINI_API_KEY for RAG ingestion." });
       return;
     }
 
@@ -1635,9 +1875,9 @@ app.post("/api/chat", async (req, res) => {
       return;
     }
 
-    if (!XAI_API_KEY) {
+    if (!HAS_XAI_CHAT && !HAS_GEMINI_CHAT) {
       res.status(500).json({
-        error: "LLM is not configured. Add XAI_API_KEY in backend environment variables.",
+        error: "LLM is not configured. Add XAI_API_KEY or GEMINI_API_KEY in backend environment variables.",
       });
       return;
     }
@@ -1669,7 +1909,7 @@ app.post("/api/chat", async (req, res) => {
           }),
           sources: [],
           meta: {
-            model_used: XAI_MODEL,
+            model_used: getDefaultModelUsed(),
             retrieved_documents: 0,
             doc_scope_requested: docIds.length > 0,
           },
@@ -1708,7 +1948,7 @@ app.post("/api/chat", async (req, res) => {
         ],
         sources: [],
         meta: {
-          model_used: XAI_MODEL,
+          model_used: getDefaultModelUsed(),
           retrieved_documents: 0,
           doc_scope_requested: docIds.length > 0,
           swipe_direction: swipeDirection,
@@ -1766,7 +2006,7 @@ app.post("/api/chat", async (req, res) => {
 
     if (mode === "summary_cards_init") {
       try {
-        const cards = await generateSummaryCardsWithGrok({
+        const generated = await generateSummaryCardsWithGrok({
           mode,
           companyName: finalCompanyName,
           symbol,
@@ -1775,10 +2015,10 @@ app.post("/api/chat", async (req, res) => {
         });
 
         res.json({
-          cards,
+          cards: generated.cards,
           sources: blendedSources,
           meta: {
-            model_used: XAI_MODEL,
+            model_used: generated.modelUsed,
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             retrieved_chunks: ragChunks.length,
@@ -1820,7 +2060,7 @@ app.post("/api/chat", async (req, res) => {
       }
 
       try {
-        const cards = await generateSummaryCardsWithGrok({
+        const generated = await generateSummaryCardsWithGrok({
           mode,
           companyName: finalCompanyName,
           symbol,
@@ -1831,10 +2071,10 @@ app.post("/api/chat", async (req, res) => {
         });
 
         res.json({
-          cards,
+          cards: generated.cards,
           sources: blendedSources,
           meta: {
-            model_used: XAI_MODEL,
+            model_used: generated.modelUsed,
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             retrieved_chunks: ragChunks.length,
@@ -1855,8 +2095,9 @@ app.post("/api/chat", async (req, res) => {
     }
 
     let answer;
+    let answerModelUsed = getDefaultModelUsed();
     try {
-      answer = await answerWithGrok({
+      const llmAnswer = await answerWithGrok({
         question,
         companyName: finalCompanyName,
         symbol,
@@ -1865,6 +2106,8 @@ app.post("/api/chat", async (req, res) => {
         history,
         isSummaryRequest,
       });
+      answer = llmAnswer.answer;
+      answerModelUsed = llmAnswer.modelUsed;
     } catch (error) {
       res.status(502).json({
         error:
@@ -1905,7 +2148,7 @@ app.post("/api/chat", async (req, res) => {
       sources,
       follow_up_questions: followUpQuestions,
       meta: {
-        model_used: XAI_MODEL,
+        model_used: answerModelUsed,
         retrieved_documents: enrichedContextDocuments.length,
         enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
         retrieved_chunks: ragChunks.length,

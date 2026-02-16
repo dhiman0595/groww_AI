@@ -83,7 +83,7 @@ export async function fetchChatAnswer(payload: ChatRequest): Promise<ChatRespons
 
     if (response.status >= 500 && !API_BASE_URL) {
       message =
-        `Backend is unavailable (status ${response.status}). Check server logs and environment variables (XAI_API_KEY, DATABASE_URL).`;
+        `Backend is unavailable (status ${response.status}). Check server logs and environment variables (XAI_API_KEY/GEMINI_API_KEY, DATABASE_URL).`;
     }
 
     if (message === "Failed to fetch chat answer from API.") {
