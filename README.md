@@ -92,7 +92,7 @@ Configure backend environment variables to fetch real filings per selected compa
 ```bash
 STOCKINSIGHTS_API_KEY=<your_api_key>
 STOCKINSIGHTS_API_URL=https://stockinsights-ai-main-95a26a0.zuplo.app/api/in/v0/documents
-STOCKINSIGHTS_COMPANY_PARAM=symbol
+STOCKINSIGHTS_COMPANY_PARAM=ticker
 ```
 
 The frontend document-type dropdown passes the selected type and backend calls this API using `document_type`.

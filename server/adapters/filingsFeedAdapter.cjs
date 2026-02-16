@@ -4,7 +4,7 @@ const FILINGS_FEED_ENDPOINT = `${
   process.env.STOCKINSIGHTS_API_URL || "https://stockinsights-ai-main-95a26a0.zuplo.app/api/in/v0/documents"
 }`.trim();
 const FILINGS_FEED_API_KEY = `${process.env.STOCKINSIGHTS_API_KEY || ""}`.trim();
-const FILINGS_FEED_COMPANY_PARAM = `${process.env.STOCKINSIGHTS_COMPANY_PARAM || "symbol"}`.trim() || "symbol";
+const FILINGS_FEED_COMPANY_PARAM = `${process.env.STOCKINSIGHTS_COMPANY_PARAM || "ticker"}`.trim() || "ticker";
 
 const SUPPORTED_DOCUMENT_TYPES = [
   "annual-report",
