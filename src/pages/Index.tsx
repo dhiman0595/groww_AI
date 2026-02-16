@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { ArrowLeft, SendHorizontal, Sparkles } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronUp, SendHorizontal, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -288,6 +288,7 @@ export function IndexPage() {
   const [selectedYearBySymbol, setSelectedYearBySymbol] = useState<Record<string, string>>({});
   const [selectedDocTypeBySymbol, setSelectedDocTypeBySymbol] = useState<Record<string, DocumentTypeFilter>>({});
   const [selectedDocIdBySymbol, setSelectedDocIdBySymbol] = useState<Record<string, string>>({});
+  const [isFilingsPanelOpenBySymbol, setIsFilingsPanelOpenBySymbol] = useState<Record<string, boolean>>({});
   const [summaryView, setSummaryView] = useState<SummaryViewState | null>(null);
   const [dragStartX, setDragStartX] = useState<number | null>(null);
   const [dragOffsetX, setDragOffsetX] = useState(0);
@@ -366,12 +367,30 @@ export function IndexPage() {
   }, [effectiveSelectedSymbol]);
 
   useEffect(() => {
+    if (!effectiveSelectedSymbol) {
+      return;
+    }
+
+    setIsFilingsPanelOpenBySymbol((previous) => {
+      if (typeof previous[effectiveSelectedSymbol] === "boolean") {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        [effectiveSelectedSymbol]: false,
+      };
+    });
+  }, [effectiveSelectedSymbol]);
+
+  useEffect(() => {
     setSummaryView(null);
     setDragStartX(null);
     setDragOffsetX(0);
   }, [effectiveSelectedSymbol]);
 
   const selectedYear = selectedYearBySymbol[effectiveSelectedSymbol] ?? "ALL";
+  const isFilingsPanelOpen = isFilingsPanelOpenBySymbol[effectiveSelectedSymbol] ?? false;
   const filteredByYear = useMemo(
     () => companyDocuments.filter((document) => matchesYear(document, selectedYear)),
     [companyDocuments, selectedYear]
@@ -754,10 +773,10 @@ export function IndexPage() {
   }
 
   return (
-    <main className="min-h-screen bg-slate-100 px-2 py-3">
+    <main className="min-h-dvh bg-slate-100 px-2 py-3">
       <div className="mx-auto w-full max-w-[430px]">
-        <Card className="flex h-[95vh] flex-col overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_24px_70px_-28px_rgba(15,23,42,0.55)]">
-          <header className="space-y-3 border-b border-slate-200 px-4 py-4">
+        <Card className="flex h-[96dvh] max-h-[96dvh] flex-col overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_24px_70px_-28px_rgba(15,23,42,0.55)]">
+          <header className="shrink-0 space-y-3 border-b border-slate-200 px-4 py-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h1 className="flex items-center gap-2 text-lg font-semibold text-slate-900">
                 <Sparkles className="size-4 text-emerald-600" />
@@ -785,187 +804,216 @@ export function IndexPage() {
             />
 
             {selectedCompany ? (
-              <div className="space-y-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                <div className="space-y-1">
-                  <Label htmlFor="fy-selection" className="text-xs text-slate-600">
-                    Financial year (FY)
-                  </Label>
-                  <select
-                    id="fy-selection"
-                    value={selectedYear}
-                    onChange={(event) =>
-                      setSelectedYearBySymbol((previous) => ({
+              <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-2.5">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-medium text-slate-700">Filings</p>
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600 hover:text-slate-900"
+                    onClick={() =>
+                      setIsFilingsPanelOpenBySymbol((previous) => ({
                         ...previous,
-                        [effectiveSelectedSymbol]: event.target.value,
+                        [effectiveSelectedSymbol]: !isFilingsPanelOpen,
                       }))
                     }
-                    className="flex h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
                   >
-                    <option value="ALL">All FY</option>
-                    {yearOptions.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
+                    {isFilingsPanelOpen ? (
+                      <>
+                        Collapse
+                        <ChevronUp className="size-3.5" />
+                      </>
+                    ) : (
+                      <>
+                        Expand
+                        <ChevronDown className="size-3.5" />
+                      </>
+                    )}
+                  </button>
                 </div>
 
-                <div className="space-y-1">
-                  <Label htmlFor="document-type-selection" className="text-xs text-slate-600">
-                    Document type
-                  </Label>
-                  <select
-                    id="document-type-selection"
-                    value={selectedDocumentType}
-                    onChange={(event) => {
-                      const nextType = event.target.value as DocumentTypeFilter;
-                      setSelectedDocTypeBySymbol((previous) => ({
-                        ...previous,
-                        [effectiveSelectedSymbol]: nextType,
-                      }));
-                      setSelectedDocIdBySymbol((previous) => ({
-                        ...previous,
-                        [effectiveSelectedSymbol]: "",
-                      }));
-                      setSummaryView(null);
-                    }}
-                    className="flex h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
-                  >
-                    {FILINGS_DOC_TYPE_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="space-y-2">
-                  <p className="text-xs font-medium text-slate-600">Filings feed</p>
-                  <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
-                    {documentsQuery.isLoading ? (
-                      <p className="text-xs text-slate-500">Loading filings...</p>
-                    ) : null}
-                    {documentsQuery.error ? (
-                      <p className="text-xs text-rose-600">{documentsQuery.error}</p>
-                    ) : null}
-
-                    {!documentsQuery.isLoading && !documentsQuery.error && documentRows.length === 0 ? (
-                      <div className="rounded-lg border border-dashed border-slate-300 bg-white p-2.5 text-xs text-slate-500">
-                        No filings found for the selected FY.
+                {isFilingsPanelOpen ? (
+                  <>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <Label htmlFor="fy-selection" className="text-[10px] uppercase tracking-wide text-slate-500">
+                          FY
+                        </Label>
+                        <select
+                          id="fy-selection"
+                          value={selectedYear}
+                          onChange={(event) =>
+                            setSelectedYearBySymbol((previous) => ({
+                              ...previous,
+                              [effectiveSelectedSymbol]: event.target.value,
+                            }))
+                          }
+                          className="flex h-8 w-full rounded-md border border-slate-200 bg-white px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
+                        >
+                          <option value="ALL">All</option>
+                          {yearOptions.map((option) => (
+                            <option key={option} value={option}>
+                              {option}
+                            </option>
+                          ))}
+                        </select>
                       </div>
-                    ) : null}
 
-                    {documentRows.map((document) => {
-                      const transcriptUrl = pickTranscriptUrl(document);
-                      const documentUrl = pickDocumentUrl(document);
-                      const isSelectedForChat = selectedChatDocument?.id === document.id;
-                      const rowDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
-                      const isRowSummaryLoading = Boolean(summaryDecksByKey[rowDeckKey]?.isLoading);
-
-                      return (
-                        <article
-                          key={document.id}
-                          className={`cursor-pointer rounded-lg border p-2.5 ${
-                            isSelectedForChat
-                              ? "border-emerald-300 bg-emerald-50/40"
-                              : "border-slate-200 bg-white"
-                          }`}
-                          onClick={() => {
+                      <div className="space-y-1">
+                        <Label
+                          htmlFor="document-type-selection"
+                          className="text-[10px] uppercase tracking-wide text-slate-500"
+                        >
+                          Document
+                        </Label>
+                        <select
+                          id="document-type-selection"
+                          value={selectedDocumentType}
+                          onChange={(event) => {
+                            const nextType = event.target.value as DocumentTypeFilter;
+                            setSelectedDocTypeBySymbol((previous) => ({
+                              ...previous,
+                              [effectiveSelectedSymbol]: nextType,
+                            }));
                             setSelectedDocIdBySymbol((previous) => ({
                               ...previous,
-                              [effectiveSelectedSymbol]:
-                                previous[effectiveSelectedSymbol] === document.id ? "" : document.id,
+                              [effectiveSelectedSymbol]: "",
                             }));
+                            setSummaryView(null);
                           }}
+                          className="flex h-8 w-full rounded-md border border-slate-200 bg-white px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0">
-                              <p className="truncate text-sm font-semibold text-slate-900">{document.title}</p>
-                              <p className="text-[11px] text-slate-500">
-                                {formatDocType(document.doc_type)}
-                                {document.quarter ? ` • ${document.quarter}` : ""}
-                                {document.fiscal_year ? ` • ${document.fiscal_year}` : ""}
-                              </p>
-                              <p className="text-[11px] text-slate-500">{formatPublishedAt(document.published_at)}</p>
+                          {FILINGS_DOC_TYPE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
+                      {documentsQuery.isLoading ? (
+                        <p className="text-xs text-slate-500">Loading filings...</p>
+                      ) : null}
+                      {documentsQuery.error ? <p className="text-xs text-rose-600">{documentsQuery.error}</p> : null}
+
+                      {!documentsQuery.isLoading && !documentsQuery.error && documentRows.length === 0 ? (
+                        <div className="rounded-md border border-dashed border-slate-300 bg-white p-2 text-[11px] text-slate-500">
+                          No filings for selected FY/type.
+                        </div>
+                      ) : null}
+
+                      {documentRows.map((document) => {
+                        const transcriptUrl = pickTranscriptUrl(document);
+                        const documentUrl = pickDocumentUrl(document);
+                        const isSelectedForChat = selectedChatDocument?.id === document.id;
+                        const rowDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
+                        const isRowSummaryLoading = Boolean(summaryDecksByKey[rowDeckKey]?.isLoading);
+
+                        return (
+                          <article
+                            key={document.id}
+                            className={`cursor-pointer rounded-md border px-2 py-2 ${
+                              isSelectedForChat ? "border-emerald-300 bg-emerald-50/40" : "border-slate-200 bg-white"
+                            }`}
+                            onClick={() => {
+                              setSelectedDocIdBySymbol((previous) => ({
+                                ...previous,
+                                [effectiveSelectedSymbol]:
+                                  previous[effectiveSelectedSymbol] === document.id ? "" : document.id,
+                              }));
+                            }}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <p className="line-clamp-1 text-xs font-semibold text-slate-900">{document.title}</p>
+                              <Badge variant="outline" className="h-5 shrink-0 px-1.5 text-[9px]">
+                                {document.exchange ?? "OTHER"}
+                              </Badge>
                             </div>
-                            <Badge variant="outline" className="shrink-0 text-[10px]">
-                              {document.exchange ?? "OTHER"}
-                            </Badge>
-                          </div>
 
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            <Button
-                              type="button"
-                              variant="outline"
-                              className="h-7 px-2 text-[11px]"
-                              disabled={isAsking}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                setSelectedDocIdBySymbol((previous) => ({
-                                  ...previous,
-                                  [effectiveSelectedSymbol]: document.id,
-                                }));
-                                void submitMainQuestion(
-                                  `Give me a risk-reward checklist and monitorables from "${document.title}" in simple language.`,
-                                  { docIds: [document.id] }
-                                );
-                              }}
-                            >
-                              Rec
-                            </Button>
+                            <p className="mt-0.5 text-[10px] text-slate-500">
+                              {formatDocType(document.doc_type)}
+                              {document.quarter ? ` • ${document.quarter}` : ""}
+                              {document.fiscal_year ? ` • ${document.fiscal_year}` : ""}
+                            </p>
+                            <p className="text-[10px] text-slate-500">{formatPublishedAt(document.published_at)}</p>
 
-                            <Button
-                              type="button"
-                              variant="outline"
-                              className="h-7 px-2 text-[11px]"
-                              disabled={!transcriptUrl}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                if (!transcriptUrl) {
-                                  return;
-                                }
-                                window.open(transcriptUrl, "_blank", "noopener,noreferrer");
-                              }}
-                            >
-                              Transcript
-                            </Button>
-
-                            {documentUrl ? (
+                            <div className="mt-1.5 flex flex-wrap gap-1">
                               <Button
                                 type="button"
                                 variant="outline"
-                                className="h-7 px-2 text-[11px]"
+                                className="h-6 px-1.5 text-[10px]"
+                                disabled={isAsking}
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  window.open(documentUrl, "_blank", "noopener,noreferrer");
+                                  setSelectedDocIdBySymbol((previous) => ({
+                                    ...previous,
+                                    [effectiveSelectedSymbol]: document.id,
+                                  }));
+                                  void submitMainQuestion(
+                                    `Give me a risk-reward checklist and monitorables from "${document.title}" in simple language.`,
+                                    { docIds: [document.id] }
+                                  );
                                 }}
                               >
-                                Document
+                                Rec
                               </Button>
-                            ) : null}
 
-                            <Button
-                              type="button"
-                              variant="outline"
-                              className="h-7 border-emerald-300 px-2 text-[11px] text-emerald-700 hover:bg-emerald-50"
-                              disabled={isRowSummaryLoading}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                setSelectedDocIdBySymbol((previous) => ({
-                                  ...previous,
-                                  [effectiveSelectedSymbol]: document.id,
-                                }));
-                                void openSummaryView(document);
-                              }}
-                            >
-                              {isRowSummaryLoading ? "Loading..." : "AI Summary"}
-                            </Button>
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
-                </div>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                className="h-6 px-1.5 text-[10px]"
+                                disabled={!transcriptUrl}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  if (!transcriptUrl) {
+                                    return;
+                                  }
+                                  window.open(transcriptUrl, "_blank", "noopener,noreferrer");
+                                }}
+                              >
+                                Transcript
+                              </Button>
+
+                              {documentUrl ? (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  className="h-6 px-1.5 text-[10px]"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    window.open(documentUrl, "_blank", "noopener,noreferrer");
+                                  }}
+                                >
+                                  Doc
+                                </Button>
+                              ) : null}
+
+                              <Button
+                                type="button"
+                                variant="outline"
+                                className="h-6 border-emerald-300 px-1.5 text-[10px] text-emerald-700 hover:bg-emerald-50"
+                                disabled={isRowSummaryLoading}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setSelectedDocIdBySymbol((previous) => ({
+                                    ...previous,
+                                    [effectiveSelectedSymbol]: document.id,
+                                  }));
+                                  void openSummaryView(document);
+                                }}
+                              >
+                                {isRowSummaryLoading ? "..." : "AI"}
+                              </Button>
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-[11px] text-slate-500">Collapsed to keep chat visible. Tap Expand to open.</p>
+                )}
               </div>
             ) : null}
           </header>
