@@ -194,14 +194,6 @@ function pickDocumentUrl(document: CompanyDocument): string {
   return document.file_url || document.source_url;
 }
 
-function pickTranscriptUrl(document: CompanyDocument): string {
-  if (document.doc_type !== "CONCALL_TRANSCRIPT") {
-    return "";
-  }
-
-  return document.file_url || document.source_url;
-}
-
 function toSummaryDeckKey(symbol: string, docId: string): string {
   return `${SUMMARY_DECK_STORAGE_PREFIX}::${symbol}::${docId}`;
 }
@@ -959,9 +951,16 @@ export function IndexPage() {
                       ) : null}
 
                       {documentRows.map((document) => {
-                        const transcriptUrl = pickTranscriptUrl(document);
                         const documentUrl = pickDocumentUrl(document);
                         const publishedLabel = formatPublishedAt(document.published_at);
+                        const metadata = [
+                          formatDocType(document.doc_type),
+                          document.quarter || "",
+                          document.fiscal_year || "",
+                        ]
+                          .filter((value) => value.length > 0)
+                          .join(" • ");
+                        const metadataLine = publishedLabel ? `${metadata} | ${publishedLabel}` : metadata;
                         const isSelectedForChat = selectedChatDocument?.id === document.id;
                         const rowDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
                         const isRowSummaryLoading = Boolean(summaryDecksByKey[rowDeckKey]?.isLoading);
@@ -980,19 +979,12 @@ export function IndexPage() {
                               }));
                             }}
                           >
-                            <div className="flex items-start justify-between gap-2">
-                              <p className="line-clamp-1 text-xs font-semibold text-slate-900">{document.title}</p>
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="line-clamp-1 text-[11px] text-slate-600">{metadataLine}</p>
                               <Badge variant="outline" className="h-5 shrink-0 px-1.5 text-[9px]">
                                 {document.exchange ?? "OTHER"}
                               </Badge>
                             </div>
-
-                            <p className="mt-0.5 text-[10px] text-slate-500">
-                              {formatDocType(document.doc_type)}
-                              {document.quarter ? ` • ${document.quarter}` : ""}
-                              {document.fiscal_year ? ` • ${document.fiscal_year}` : ""}
-                            </p>
-                            {publishedLabel ? <p className="text-[10px] text-slate-500">{publishedLabel}</p> : null}
 
                             <div className="mt-1.5 flex flex-wrap gap-1">
                               <Button
@@ -1013,22 +1005,6 @@ export function IndexPage() {
                                 }}
                               >
                                 Rec
-                              </Button>
-
-                              <Button
-                                type="button"
-                                variant="outline"
-                                className="h-6 px-1.5 text-[10px]"
-                                disabled={!transcriptUrl}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  if (!transcriptUrl) {
-                                    return;
-                                  }
-                                  window.open(transcriptUrl, "_blank", "noopener,noreferrer");
-                                }}
-                              >
-                                Transcript
                               </Button>
 
                               {documentUrl ? (

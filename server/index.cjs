@@ -22,10 +22,18 @@ const {
   withinDateRange,
 } = require("./utils/documentHelpers.cjs");
 const { fetchCompaniesFromMaster, hasMasterDatabase } = require("./db/companiesMaster.cjs");
+const {
+  ensureRagSchema,
+  findIndexedDocIds,
+  hasRagDatabase,
+  searchRagChunks,
+  upsertRagChunks,
+} = require("./db/ragStore.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
 const GEMINI_API_KEY = `${process.env.GEMINI_API_KEY || ""}`.trim();
 const GEMINI_MODEL = `${process.env.GEMINI_MODEL || "gemini-2.5-flash"}`.trim();
+const GEMINI_EMBEDDING_MODEL = `${process.env.GEMINI_EMBEDDING_MODEL || "text-embedding-004"}`.trim();
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
 const DIST_INDEX_FILE = path.join(DIST_DIR, "index.html");
 const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
@@ -34,12 +42,23 @@ const app = express();
 const SUMMARY_REGEX = /\b(summary|summarize|deep analysis|analysis|overview|digest)\b/i;
 const PDF_TEXT_FETCH_TIMEOUT_MS = 12000;
 const PDF_TEXT_MAX_BYTES = 12 * 1024 * 1024;
-const PDF_TEXT_MAX_CHARS = 12000;
+const PDF_TEXT_MAX_CHARS = 45000;
 const PDF_TEXT_PAGE_LIMIT = 8;
+const RAG_INGEST_PRELOAD_LIMIT = Math.max(1, Math.min(Number(process.env.RAG_INGEST_PRELOAD_LIMIT || 6), 12));
+const RAG_MAX_CHUNKS_PER_DOC = Math.max(3, Math.min(Number(process.env.RAG_MAX_CHUNKS_PER_DOC || 16), 30));
+const RAG_CHUNK_CHAR_SIZE = Math.max(500, Math.min(Number(process.env.RAG_CHUNK_CHAR_SIZE || 1200), 2200));
+const RAG_CHUNK_OVERLAP = Math.max(50, Math.min(Number(process.env.RAG_CHUNK_OVERLAP || 180), 600));
+const RAG_RETRIEVAL_LIMIT = Math.max(2, Math.min(Number(process.env.RAG_RETRIEVAL_LIMIT || 8), 20));
+const RAG_EMBEDDING_INPUT_CHARS = Math.max(200, Math.min(Number(process.env.RAG_EMBEDDING_INPUT_CHARS || 2400), 5000));
 const pdfTextCache = new Map();
+const ragIngestionInFlight = new Set();
 
 app.use(cors());
 app.use(express.json());
+
+if (hasRagDatabase() && GEMINI_API_KEY) {
+  void ensureRagSchema();
+}
 
 function toInternalDocTypeFilter(rawValue) {
   const raw = `${rawValue || "ALL"}`.trim();
@@ -472,6 +491,343 @@ async function enrichDocumentsWithPdfText(documents) {
   );
 }
 
+function estimateTokenCount(text) {
+  const normalized = normalizeWhitespace(text);
+  if (!normalized) {
+    return 0;
+  }
+  return Math.max(1, Math.ceil(normalized.length / 4));
+}
+
+function splitTextIntoRagChunks(text) {
+  const normalized = normalizeWhitespace(text);
+  if (!normalized) {
+    return [];
+  }
+
+  const chunks = [];
+  let start = 0;
+
+  while (start < normalized.length && chunks.length < RAG_MAX_CHUNKS_PER_DOC) {
+    const hardEnd = Math.min(normalized.length, start + RAG_CHUNK_CHAR_SIZE);
+    let end = hardEnd;
+
+    if (hardEnd < normalized.length) {
+      const lastSpaceIndex = normalized.lastIndexOf(" ", hardEnd);
+      if (lastSpaceIndex > start + 220) {
+        end = lastSpaceIndex;
+      }
+    }
+
+    const chunk = normalized.slice(start, end).trim();
+    if (chunk.length >= 80) {
+      chunks.push(chunk);
+    }
+
+    if (end >= normalized.length) {
+      break;
+    }
+
+    start = Math.max(end - RAG_CHUNK_OVERLAP, start + 1);
+  }
+
+  return chunks;
+}
+
+function createRagChunkId(document, chunkIndex, chunkText) {
+  return `chunk_${stableHash(
+    `${document.id}|${document.symbol}|${chunkIndex}|${chunkText.slice(0, 120)}|${document.published_at || ""}`
+  )}`;
+}
+
+async function requestGeminiEmbedding(text, taskType) {
+  if (!GEMINI_API_KEY) {
+    return [];
+  }
+
+  const prompt = `${text || ""}`.trim();
+  if (!prompt) {
+    return [];
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_EMBEDDING_MODEL
+  )}:embedContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      content: {
+        parts: [{ text: prompt.slice(0, RAG_EMBEDDING_INPUT_CHARS) }],
+      },
+      taskType: taskType || "RETRIEVAL_DOCUMENT",
+    }),
+  });
+
+  if (!response.ok) {
+    const reason = await response.text().catch(() => "");
+    throw new Error(`Embedding request failed (${response.status}): ${reason.slice(0, 180)}`);
+  }
+
+  const data = await response.json();
+  const valuesFromSingle = Array.isArray(data?.embedding?.values) ? data.embedding.values : [];
+  const valuesFromBatch = Array.isArray(data?.embeddings?.[0]?.values) ? data.embeddings[0].values : [];
+  const values = valuesFromSingle.length > 0 ? valuesFromSingle : valuesFromBatch;
+
+  if (!Array.isArray(values) || values.length === 0) {
+    return [];
+  }
+
+  return values.map((value) => (Number.isFinite(Number(value)) ? Number(value) : 0));
+}
+
+async function ingestDocumentIntoRag(document) {
+  if (!document || !hasRagDatabase()) {
+    return 0;
+  }
+
+  const schemaReady = await ensureRagSchema();
+  if (!schemaReady) {
+    return 0;
+  }
+
+  const pdfUrl = document.file_url || document.source_url;
+  const fullText = await fetchPdfText(pdfUrl);
+  const fallbackText = hasMeaningfulDescription(document) ? document.description : "";
+  const content = normalizeWhitespace(fullText || fallbackText);
+  if (!content) {
+    return 0;
+  }
+
+  const chunks = splitTextIntoRagChunks(content);
+  if (chunks.length === 0) {
+    return 0;
+  }
+
+  const rows = [];
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunkText = chunks[index];
+    let embedding;
+    try {
+      embedding = await requestGeminiEmbedding(chunkText, "RETRIEVAL_DOCUMENT");
+    } catch (error) {
+      console.error("Chunk embedding failed:", error.message);
+      continue;
+    }
+
+    if (!Array.isArray(embedding) || embedding.length === 0) {
+      continue;
+    }
+
+    rows.push({
+      chunk_id: createRagChunkId(document, index, chunkText),
+      doc_id: document.id,
+      symbol: document.symbol,
+      company_name: document.company_name,
+      doc_type: document.doc_type,
+      title: document.title,
+      quarter: document.quarter,
+      fiscal_year: document.fiscal_year,
+      published_at: document.published_at,
+      source_name: document.source_name,
+      source_url: document.source_url,
+      file_url: document.file_url,
+      chunk_index: index,
+      chunk_text: chunkText,
+      chunk_tokens: estimateTokenCount(chunkText),
+      embedding,
+    });
+  }
+
+  if (rows.length === 0) {
+    return 0;
+  }
+
+  return upsertRagChunks(rows);
+}
+
+function queueRagIngestion(document) {
+  if (!document?.id || ragIngestionInFlight.has(document.id)) {
+    return;
+  }
+
+  ragIngestionInFlight.add(document.id);
+  setTimeout(() => {
+    void ingestDocumentIntoRag(document)
+      .catch((error) => {
+        console.error(`RAG ingestion failed for ${document.id}:`, error.message);
+      })
+      .finally(() => {
+        ragIngestionInFlight.delete(document.id);
+      });
+  }, 0);
+}
+
+async function ensureRagCoverage(documents, options = {}) {
+  if (!hasRagDatabase() || !GEMINI_API_KEY) {
+    return;
+  }
+
+  const safeDocuments = Array.isArray(documents) ? documents.filter((document) => Boolean(document?.id)) : [];
+  if (safeDocuments.length === 0) {
+    return;
+  }
+
+  const schemaReady = await ensureRagSchema();
+  if (!schemaReady) {
+    return;
+  }
+
+  const docIds = safeDocuments.map((document) => document.id);
+  const indexedDocIds = await findIndexedDocIds(docIds);
+  const missingDocuments = safeDocuments.filter((document) => !indexedDocIds.has(document.id));
+  if (missingDocuments.length === 0) {
+    return;
+  }
+
+  const blockingCount = Math.max(0, Math.min(Number(options.blockingCount) || 0, missingDocuments.length));
+  const blockingDocuments = missingDocuments.slice(0, blockingCount);
+  for (const document of blockingDocuments) {
+    try {
+      await ingestDocumentIntoRag(document);
+    } catch (error) {
+      console.error(`RAG blocking ingestion failed for ${document.id}:`, error.message);
+    }
+  }
+
+  const backgroundCandidates = missingDocuments.slice(blockingCount, RAG_INGEST_PRELOAD_LIMIT);
+  for (const document of backgroundCandidates) {
+    queueRagIngestion(document);
+  }
+}
+
+async function retrieveRagChunksForQuestion(options = {}) {
+  const symbol = `${options.symbol || ""}`.trim().toUpperCase();
+  const question = `${options.question || ""}`.trim();
+  const year = `${options.year || ""}`.trim();
+  const docIds = Array.isArray(options.docIds)
+    ? options.docIds.map((value) => `${value || ""}`.trim()).filter((value) => value.length > 0)
+    : [];
+  const limit = Math.max(2, Math.min(Number(options.limit) || RAG_RETRIEVAL_LIMIT, 20));
+
+  if (!symbol || !question || !hasRagDatabase() || !GEMINI_API_KEY) {
+    return [];
+  }
+
+  const schemaReady = await ensureRagSchema();
+  if (!schemaReady) {
+    return [];
+  }
+
+  let queryEmbedding;
+  try {
+    queryEmbedding = await requestGeminiEmbedding(question, "RETRIEVAL_QUERY");
+  } catch (error) {
+    console.error("Query embedding failed:", error.message);
+    return [];
+  }
+
+  if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
+    return [];
+  }
+
+  try {
+    return await searchRagChunks({
+      symbol,
+      embedding: queryEmbedding,
+      docIds,
+      year,
+      limit,
+    });
+  } catch (error) {
+    console.error("RAG retrieval failed:", error.message);
+    return [];
+  }
+}
+
+function buildChunkContextLines(chunks) {
+  return chunks.map((chunk, index) => {
+    const relevance = Number.isFinite(chunk.similarity) ? Math.max(0, Math.min(chunk.similarity, 1)) : 0;
+    return [
+      `[C${index + 1}] ${chunk.title} (chunk ${Number(chunk.chunk_index) + 1}, relevance ${relevance.toFixed(2)})`,
+      `Type: ${chunk.doc_type || "n/a"}`,
+      `Quarter: ${chunk.quarter || "n/a"}`,
+      `Fiscal year: ${chunk.fiscal_year || "n/a"}`,
+      `Source: ${chunk.source_name || "Public filing"}`,
+      `Snippet: ${normalizeWhitespace(chunk.chunk_text).slice(0, 900)}`,
+    ].join("\n");
+  });
+}
+
+function buildChunkSources(chunks, limit = 8) {
+  const map = new Map();
+
+  for (const chunk of chunks) {
+    const key = `${chunk.doc_id}:${chunk.chunk_index}`;
+    if (map.has(key)) {
+      continue;
+    }
+
+    map.set(key, {
+      title: `${chunk.title} [chunk ${Number(chunk.chunk_index) + 1}]`,
+      url: chunk.source_url || chunk.file_url || "",
+      source_name: chunk.source_name || "Filing chunk",
+      published_at: chunk.published_at || "",
+    });
+
+    if (map.size >= limit) {
+      break;
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+function mergeUniqueSources(primary, secondary, limit = 8) {
+  const map = new Map();
+
+  for (const source of [...primary, ...secondary]) {
+    const key = `${source.title || ""}|${source.url || ""}|${source.source_name || ""}`;
+    if (map.has(key)) {
+      continue;
+    }
+    map.set(key, source);
+    if (map.size >= limit) {
+      break;
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+function deriveConfidenceMeta({ ragChunks, documents }) {
+  const chunkCount = Array.isArray(ragChunks) ? ragChunks.length : 0;
+  const docCount = Array.isArray(documents) ? documents.length : 0;
+
+  if (chunkCount >= 5) {
+    return {
+      confidence_label: "high",
+      confidence_reason: `Answer grounded in ${chunkCount} retrieved filing chunks across ${docCount} documents.`,
+    };
+  }
+
+  if (chunkCount >= 2) {
+    return {
+      confidence_label: "medium",
+      confidence_reason: `Answer grounded in ${chunkCount} filing chunks; evidence coverage is moderate.`,
+    };
+  }
+
+  return {
+    confidence_label: "low",
+    confidence_reason: "Limited chunk-level evidence was available; answer relied on high-level filing snippets.",
+  };
+}
+
 function extractMetricSignals(documents) {
   const signals = [];
 
@@ -620,7 +976,7 @@ function buildContextLines(documents) {
       ? `Extracted filing text: ${normalizeWhitespace(document.rag_excerpt).slice(0, 1000)}`
       : "";
     return [
-      `[${index + 1}] ${document.title}`,
+      `[D${index + 1}] ${document.title}`,
       `Type: ${document.doc_type}`,
       quarterLine,
       yearLine,
@@ -882,7 +1238,7 @@ async function requestGemini(payload) {
   return response.json();
 }
 
-async function answerWithGemini({ question, companyName, symbol, documents, history, isSummaryRequest }) {
+async function answerWithGemini({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
   if (!GEMINI_API_KEY) {
     throw new Error("LLM is not configured. Set GEMINI_API_KEY on the backend.");
   }
@@ -892,6 +1248,7 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
   }
 
   const contextLines = buildContextLines(documents);
+  const chunkLines = buildChunkContextLines(Array.isArray(ragChunks) ? ragChunks : []);
 
   const summaryInstruction = isSummaryRequest
     ? [
@@ -906,8 +1263,9 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
         "- What details/interpretations add value",
         "- What level of depth is useful vs unnecessary",
         "- What usually gets ignored but should not be ignored",
+        "Use chunk citations like [C1], [C2] to support claims whenever chunk evidence is available.",
       ].join("\n")
-    : "Answer in concise, beginner-friendly language and cite context snippets like [1], [2].";
+    : "Answer in concise, beginner-friendly language and cite chunk references like [C1], [C2] (or [D1], [D2] if only document-level evidence exists).";
 
   const systemPrompt = [
     "You are Groww AI for beginner investors.",
@@ -917,12 +1275,19 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
     summaryInstruction,
   ].join("\n");
 
+  const evidenceSections = [];
+  if (chunkLines.length > 0) {
+    evidenceSections.push("Retrieved filing chunks (highest priority evidence):");
+    evidenceSections.push(chunkLines.join("\n\n"));
+  }
+  evidenceSections.push("Retrieved filing snippets (fallback context):");
+  evidenceSections.push(contextLines.join("\n\n"));
+
   const questionPrompt = [
     `Company: ${companyName || symbol}`,
     `Symbol: ${symbol}`,
     `Question: ${question}`,
-    "Retrieved filing snippets:",
-    contextLines.join("\n\n"),
+    ...evidenceSections,
   ].join("\n\n");
 
   const payload = {
@@ -955,6 +1320,7 @@ async function generateSummaryCardsWithGemini({
   companyName,
   symbol,
   documents,
+  ragChunks,
   swipeDirection,
   currentCard,
 }) {
@@ -962,7 +1328,11 @@ async function generateSummaryCardsWithGemini({
     throw new Error("LLM is not configured. Set GEMINI_API_KEY on the backend.");
   }
 
-  const contextLines = buildContextLines(documents).join("\n\n");
+  const docContextLines = buildContextLines(documents).join("\n\n");
+  const chunkContextLines = buildChunkContextLines(Array.isArray(ragChunks) ? ragChunks : []).join("\n\n");
+  const contextLines = chunkContextLines
+    ? `Chunk evidence:\n${chunkContextLines}\n\nDocument evidence:\n${docContextLines}`
+    : docContextLines;
 
   const systemPrompt = [
     "You are Groww AI card composer for beginners.",
@@ -1124,6 +1494,11 @@ app.get("/api/documents", async (req, res) => {
     const start = (page - 1) * pageSize;
     const end = start + pageSize;
 
+    if (hasRagDatabase() && GEMINI_API_KEY) {
+      const preloadDocuments = sorted.slice(0, RAG_INGEST_PRELOAD_LIMIT).map((item) => normalizeChatDocument(item));
+      void ensureRagCoverage(preloadDocuments, { blockingCount: 0 });
+    }
+
     res.json({
       items: sorted.slice(start, end),
       total: sorted.length,
@@ -1132,6 +1507,63 @@ app.get("/api/documents", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch documents." });
+  }
+});
+
+app.post("/api/rag/ingest", async (req, res) => {
+  try {
+    const symbol = `${req.body.symbol || ""}`.trim().toUpperCase();
+    const docType = `${req.body.doc_type || "ALL"}`.trim();
+    const limit = Math.max(1, Math.min(Number(req.body.limit) || RAG_INGEST_PRELOAD_LIMIT, 20));
+
+    if (!symbol) {
+      res.status(400).json({ error: "'symbol' is required." });
+      return;
+    }
+
+    if (!hasRagDatabase()) {
+      res.status(400).json({ error: "RAG database is unavailable. Set DATABASE_URL first." });
+      return;
+    }
+
+    if (!GEMINI_API_KEY) {
+      res.status(400).json({ error: "GEMINI_API_KEY is required for RAG ingestion." });
+      return;
+    }
+
+    const normalizedRequestedType = normalizeRequestedType(docType);
+    const internalDocType = toInternalDocTypeFilter(docType);
+    const rawItems = await loadRawDocuments(symbol, {
+      documentType: normalizedRequestedType,
+    });
+
+    const normalizedDocs = rawItems
+      .filter((item) => inferSymbol(item) === symbol)
+      .filter((item) => matchesDocType(item, internalDocType))
+      .map((item) => normalizeChatDocument(item))
+      .sort((left, right) => {
+        const leftParsed = new Date(left.published_at).getTime();
+        const rightParsed = new Date(right.published_at).getTime();
+        const leftTs = Number.isFinite(leftParsed) ? leftParsed : 0;
+        const rightTs = Number.isFinite(rightParsed) ? rightParsed : 0;
+        return rightTs - leftTs;
+      });
+
+    const targetDocs = normalizedDocs.slice(0, limit);
+    await ensureRagCoverage(targetDocs, {
+      blockingCount: targetDocs.length,
+    });
+
+    const indexedIds = await findIndexedDocIds(targetDocs.map((document) => document.id));
+
+    res.json({
+      symbol,
+      requested: targetDocs.length,
+      indexed: indexedIds.size,
+      rag_ready: indexedIds.size > 0,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to ingest documents into RAG store." });
   }
 });
 
@@ -1279,6 +1711,32 @@ app.post("/api/chat", async (req, res) => {
     const contextDocuments = topDocuments.length > 0 ? topDocuments : retrievalPool.slice(0, 8);
 
     const enrichedContextDocuments = await enrichDocumentsWithPdfText(contextDocuments);
+    await ensureRagCoverage(enrichedContextDocuments, {
+      blockingCount: mode === "chat" ? 2 : 1,
+    });
+
+    const retrievalQuestion =
+      mode === "chat"
+        ? question
+        : mode === "summary_cards_next"
+          ? `${currentCard?.title || ""} ${currentCard?.concept || ""}`.trim() || "deeper filing understanding"
+          : "business model metrics management commentary risks";
+
+    const ragChunks = await retrieveRagChunksForQuestion({
+      symbol,
+      question: retrievalQuestion,
+      docIds: enrichedContextDocuments.map((document) => document.id),
+      year,
+      limit: RAG_RETRIEVAL_LIMIT,
+    });
+
+    const chunkSources = buildChunkSources(ragChunks, 8);
+    const fallbackSources = uniqueSources(enrichedContextDocuments, 8);
+    const blendedSources = mergeUniqueSources(chunkSources, fallbackSources, 8);
+    const confidenceMeta = deriveConfidenceMeta({
+      ragChunks,
+      documents: enrichedContextDocuments,
+    });
     const finalCompanyName = companyName || enrichedContextDocuments[0]?.company_name || symbol;
 
     if (mode === "summary_cards_init") {
@@ -1288,15 +1746,18 @@ app.post("/api/chat", async (req, res) => {
           companyName: finalCompanyName,
           symbol,
           documents: enrichedContextDocuments,
+          ragChunks,
         });
 
         res.json({
           cards,
-          sources: uniqueSources(contextDocuments, 8),
+          sources: blendedSources,
           meta: {
             model_used: GEMINI_MODEL,
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
+            retrieved_chunks: ragChunks.length,
+            ...confidenceMeta,
             doc_scope_requested: docIds.length > 0,
           },
         });
@@ -1339,17 +1800,20 @@ app.post("/api/chat", async (req, res) => {
           companyName: finalCompanyName,
           symbol,
           documents: enrichedContextDocuments,
+          ragChunks,
           swipeDirection,
           currentCard: currentCardPayload,
         });
 
         res.json({
           cards,
-          sources: uniqueSources(contextDocuments, 8),
+          sources: blendedSources,
           meta: {
             model_used: GEMINI_MODEL,
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
+            retrieved_chunks: ragChunks.length,
+            ...confidenceMeta,
             doc_scope_requested: docIds.length > 0,
             swipe_direction: swipeDirection,
           },
@@ -1372,6 +1836,7 @@ app.post("/api/chat", async (req, res) => {
         companyName: finalCompanyName,
         symbol,
         documents: enrichedContextDocuments,
+        ragChunks,
         history,
         isSummaryRequest,
       });
@@ -1402,7 +1867,7 @@ app.post("/api/chat", async (req, res) => {
           });
     }
 
-    const sources = uniqueSources(enrichedContextDocuments, 8);
+    const sources = blendedSources;
     const followUpQuestions = buildFollowUpQuestions({
       companyName: finalCompanyName,
       year,
@@ -1418,6 +1883,8 @@ app.post("/api/chat", async (req, res) => {
         model_used: GEMINI_MODEL,
         retrieved_documents: enrichedContextDocuments.length,
         enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
+        retrieved_chunks: ragChunks.length,
+        ...confidenceMeta,
         doc_scope_requested: docIds.length > 0,
       },
     });
