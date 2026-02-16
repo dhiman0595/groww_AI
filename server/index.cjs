@@ -1,5 +1,6 @@
 const path = require("node:path");
 const fs = require("node:fs");
+const pdfParse = require("pdf-parse");
 const express = require("express");
 const cors = require("cors");
 const { MOCK_SOURCE_FIXTURES } = require("./mock/rawFixtures.cjs");
@@ -31,6 +32,11 @@ const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
 const app = express();
 
 const SUMMARY_REGEX = /\b(summary|summarize|deep analysis|analysis|overview|digest)\b/i;
+const PDF_TEXT_FETCH_TIMEOUT_MS = 12000;
+const PDF_TEXT_MAX_BYTES = 12 * 1024 * 1024;
+const PDF_TEXT_MAX_CHARS = 12000;
+const PDF_TEXT_PAGE_LIMIT = 8;
+const pdfTextCache = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -310,8 +316,10 @@ function rankDocuments(documents, options) {
         return scoreDiff;
       }
 
-      const leftTs = new Date(left.document.published_at).getTime();
-      const rightTs = new Date(right.document.published_at).getTime();
+      const leftParsed = new Date(left.document.published_at).getTime();
+      const rightParsed = new Date(right.document.published_at).getTime();
+      const leftTs = Number.isFinite(leftParsed) ? leftParsed : 0;
+      const rightTs = Number.isFinite(rightParsed) ? rightParsed : 0;
       return rightTs - leftTs;
     })
     .map((item) => item.document);
@@ -346,6 +354,122 @@ function summarizeDocumentLine(document) {
   const yearPart = document.fiscal_year ? ` | ${document.fiscal_year}` : "";
   const description = document.description ? ` | ${document.description}` : "";
   return `${document.title} (${document.doc_type}${quarterPart}${yearPart})${description}`;
+}
+
+function normalizeWhitespace(value) {
+  return `${value || ""}`.replace(/\s+/g, " ").trim();
+}
+
+function hasMeaningfulDescription(document) {
+  const normalized = normalizeWhitespace(document?.description);
+  if (!normalized) {
+    return false;
+  }
+
+  const lower = normalized.toLowerCase();
+  if (/^no summary available\.?$/.test(lower) || /^summary not available\.?$/.test(lower)) {
+    return false;
+  }
+  if (/^(not available|n\/a|na|none|null|nil)$/i.test(lower)) {
+    return false;
+  }
+  if (/^[-.]+$/.test(lower)) {
+    return false;
+  }
+
+  return true;
+}
+
+function looksLikePdfUrl(url) {
+  const normalized = `${url || ""}`.toLowerCase();
+  return (
+    normalized.includes(".pdf") ||
+    normalized.includes("annpdfopen") ||
+    normalized.includes("/announcements/") ||
+    normalized.includes("s3.amazonaws.com")
+  );
+}
+
+async function fetchPdfText(url) {
+  if (!url || !looksLikePdfUrl(url)) {
+    return "";
+  }
+
+  if (pdfTextCache.has(url)) {
+    return pdfTextCache.get(url);
+  }
+
+  const pending = (async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PDF_TEXT_FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          Accept: "application/pdf,*/*",
+          "User-Agent": "Groww-AI/1.0 (+https://groww-ai.onrender.com)",
+          Referer: "https://www.bseindia.com/",
+        },
+      });
+
+      if (!response.ok) {
+        return "";
+      }
+
+      const bytes = Number(response.headers.get("content-length") || 0);
+      if (bytes > PDF_TEXT_MAX_BYTES) {
+        return "";
+      }
+
+      const contentType = `${response.headers.get("content-type") || ""}`.toLowerCase();
+      if (!contentType.includes("pdf") && !looksLikePdfUrl(url)) {
+        return "";
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!buffer || buffer.length === 0 || buffer.length > PDF_TEXT_MAX_BYTES) {
+        return "";
+      }
+
+      const parsed = await pdfParse(buffer, {
+        max: PDF_TEXT_PAGE_LIMIT,
+      });
+
+      const text = normalizeWhitespace(parsed?.text || "");
+      return text.slice(0, PDF_TEXT_MAX_CHARS);
+    } catch {
+      return "";
+    } finally {
+      clearTimeout(timeout);
+    }
+  })();
+
+  pdfTextCache.set(url, pending);
+  return pending;
+}
+
+async function enrichDocumentsWithPdfText(documents) {
+  return Promise.all(
+    documents.map(async (document) => {
+      if (!document || hasMeaningfulDescription(document)) {
+        return document;
+      }
+
+      const pdfUrl = document.file_url || document.source_url;
+      const ragText = await fetchPdfText(pdfUrl);
+      if (!ragText) {
+        return document;
+      }
+
+      return {
+        ...document,
+        rag_excerpt: ragText,
+        description: ragText.slice(0, 420),
+      };
+    })
+  );
 }
 
 function extractMetricSignals(documents) {
@@ -491,14 +615,19 @@ function buildContextLines(documents) {
   return documents.map((document, index) => {
     const quarterLine = document.quarter ? `Quarter: ${document.quarter}` : "Quarter: n/a";
     const yearLine = document.fiscal_year ? `Fiscal year: ${document.fiscal_year}` : "Fiscal year: n/a";
+    const summaryText = hasMeaningfulDescription(document) ? document.description : "No summary available.";
+    const ragLine = document.rag_excerpt
+      ? `Extracted filing text: ${normalizeWhitespace(document.rag_excerpt).slice(0, 1000)}`
+      : "";
     return [
       `[${index + 1}] ${document.title}`,
       `Type: ${document.doc_type}`,
       quarterLine,
       yearLine,
-      `Published: ${document.published_at}`,
+      `Published: ${document.published_at || "n/a"}`,
       `Source: ${document.source_name}`,
-      `Summary: ${document.description || "No summary available."}`,
+      `Summary: ${summaryText}`,
+      ragLine,
     ].join("\n");
   });
 }
@@ -635,13 +764,13 @@ function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }
     title,
     explanation: deeper
       ? "This deeper layer focuses on cause-effect links between commentary, numbers, and likely forward implications."
-      : "This simpler layer restates the concept in plain language with fewer assumptions and less jargon.",
+      : "This view explains the same evidence from a different perspective to improve understanding.",
     why_it_matters: deeper
       ? "Depth helps detect thesis strength, fragility, and consistency over time."
-      : "Clarity helps avoid confidence built on misunderstood terms.",
+      : "Alternative perspectives reduce blind spots and improve clarity.",
     example: deeper
       ? "Compare two sequential filings and identify one claim that strengthened and one that weakened."
-      : "Explain the concept to a non-finance friend in one sentence and check if the core meaning stays correct.",
+      : "Reframe this using a customer, operations, or cash-flow lens and check if the insight still holds.",
     level: nextLevel,
     source_refs: normalizeCardSources([], fallbackDocument),
   };
@@ -839,6 +968,8 @@ async function generateSummaryCardsWithGemini({
     "You are Groww AI card composer for beginners.",
     "Return strict JSON only. Do not include markdown or extra prose.",
     "Use only provided filing context.",
+    "If swipe direction is right: go deeper with more evidence from the report context.",
+    "If swipe direction is left: explain from an alternative perspective to improve understanding.",
     "Each card must include: concept, title, explanation, why_it_matters, example, level, source_refs.",
     "source_refs should be an array of objects with title and optional url/source_name.",
   ].join("\n");
@@ -860,8 +991,8 @@ async function generateSummaryCardsWithGemini({
           `Current card: ${JSON.stringify(currentCard)}`,
           `Swipe direction: ${swipeDirection}`,
           swipeDirection === "right"
-            ? "Task: Generate exactly 1 deeper follow-up card (higher level)."
-            : "Task: Generate exactly 1 simpler explanatory card (same/lower level, easier language).",
+            ? "Task: Generate exactly 1 deeper follow-up card (higher level) with tighter report-grounded evidence."
+            : "Task: Generate exactly 1 alternative-perspective card (different framing) to improve understanding.",
           "Output JSON shape: {\"cards\":[{...}]}",
           "Context:",
           contextLines,
@@ -1147,7 +1278,8 @@ app.post("/api/chat", async (req, res) => {
     const topDocuments = ranked.slice(0, 8);
     const contextDocuments = topDocuments.length > 0 ? topDocuments : retrievalPool.slice(0, 8);
 
-    const finalCompanyName = companyName || contextDocuments[0]?.company_name || symbol;
+    const enrichedContextDocuments = await enrichDocumentsWithPdfText(contextDocuments);
+    const finalCompanyName = companyName || enrichedContextDocuments[0]?.company_name || symbol;
 
     if (mode === "summary_cards_init") {
       try {
@@ -1155,7 +1287,7 @@ app.post("/api/chat", async (req, res) => {
           mode,
           companyName: finalCompanyName,
           symbol,
-          documents: contextDocuments,
+          documents: enrichedContextDocuments,
         });
 
         res.json({
@@ -1164,6 +1296,7 @@ app.post("/api/chat", async (req, res) => {
           meta: {
             model_used: GEMINI_MODEL,
             retrieved_documents: contextDocuments.length,
+            enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             doc_scope_requested: docIds.length > 0,
           },
         });
@@ -1205,7 +1338,7 @@ app.post("/api/chat", async (req, res) => {
           mode,
           companyName: finalCompanyName,
           symbol,
-          documents: contextDocuments,
+          documents: enrichedContextDocuments,
           swipeDirection,
           currentCard: currentCardPayload,
         });
@@ -1216,6 +1349,7 @@ app.post("/api/chat", async (req, res) => {
           meta: {
             model_used: GEMINI_MODEL,
             retrieved_documents: contextDocuments.length,
+            enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             doc_scope_requested: docIds.length > 0,
             swipe_direction: swipeDirection,
           },
@@ -1237,7 +1371,7 @@ app.post("/api/chat", async (req, res) => {
         question,
         companyName: finalCompanyName,
         symbol,
-        documents: contextDocuments,
+        documents: enrichedContextDocuments,
         history,
         isSummaryRequest,
       });
@@ -1256,7 +1390,7 @@ app.post("/api/chat", async (req, res) => {
         ? buildSummaryAnswer({
             companyName: finalCompanyName,
             symbol,
-            documents: contextDocuments,
+            documents: enrichedContextDocuments,
             year,
             quarter,
           })
@@ -1264,16 +1398,16 @@ app.post("/api/chat", async (req, res) => {
             companyName: finalCompanyName,
             symbol,
             question,
-            documents: contextDocuments,
+            documents: enrichedContextDocuments,
           });
     }
 
-    const sources = uniqueSources(contextDocuments, 8);
+    const sources = uniqueSources(enrichedContextDocuments, 8);
     const followUpQuestions = buildFollowUpQuestions({
       companyName: finalCompanyName,
       year,
       quarter,
-      topDocuments: contextDocuments,
+      topDocuments: enrichedContextDocuments,
     });
 
     res.json({
@@ -1282,7 +1416,8 @@ app.post("/api/chat", async (req, res) => {
       follow_up_questions: followUpQuestions,
       meta: {
         model_used: GEMINI_MODEL,
-        retrieved_documents: contextDocuments.length,
+        retrieved_documents: enrichedContextDocuments.length,
+        enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
         doc_scope_requested: docIds.length > 0,
       },
     });

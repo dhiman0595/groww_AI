@@ -1,4 +1,5 @@
 const { createHash } = require("node:crypto");
+const { normalizePublishedAtValue } = require("../utils/documentHelpers.cjs");
 
 const FILINGS_FEED_ENDPOINT = `${
   process.env.STOCKINSIGHTS_API_URL || "https://stockinsights-ai-main-95a26a0.zuplo.app/api/in/v0/documents"
@@ -179,9 +180,19 @@ function mapFeedDocumentToRaw(record, context) {
   const description = pickString(record, ["description", "summary", "note", "details", "snippet"]);
   const quarter = pickString(record, ["quarter", "fiscal_quarter", "qtr"]);
   const fiscalYear = pickString(record, ["fiscal_year", "financial_year", "fy", "year"]);
-  const publishedAt =
-    pickString(record, ["published_at", "published_on", "created_at", "document_date", "date", "timestamp"]) ||
-    new Date(0).toISOString();
+  const publishedAt = normalizePublishedAtValue(
+    pickString(record, [
+      "published_date",
+      "published_at",
+      "published_on",
+      "publishedDate",
+      "created_at",
+      "document_date",
+      "announcement_date",
+      "date",
+      "timestamp",
+    ])
+  );
   const sourceUrl = pickString(record, ["source_url", "url", "link", "page_url", "document_url", "web_url"]);
   const fileUrl = pickString(record, ["file_url", "pdf_url", "download_url", "attachment_url", "transcript_url"]);
   const isin = cleanUpperText(pickString(record, ["isin", "isin_code"]));

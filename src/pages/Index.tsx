@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
+} from "react";
 import { ArrowLeft, ChevronDown, ChevronUp, SendHorizontal, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -161,10 +167,11 @@ function formatDocType(type: CompanyDocument["doc_type"]): string {
   }
 }
 
-function formatPublishedAt(value: string): string {
+function formatPublishedAt(value: string): string | null {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "Unknown date";
+  const ts = date.getTime();
+  if (Number.isNaN(ts) || date.getFullYear() <= 1971) {
+    return null;
   }
 
   return date.toLocaleString("en-IN", {
@@ -401,8 +408,10 @@ export function IndexPage() {
     const source = scoped.length > 0 ? scoped : filteredByYear;
 
     return [...source].sort((left, right) => {
-      const leftTs = new Date(left.published_at).getTime();
-      const rightTs = new Date(right.published_at).getTime();
+      const leftParsed = new Date(left.published_at).getTime();
+      const rightParsed = new Date(right.published_at).getTime();
+      const leftTs = Number.isFinite(leftParsed) ? leftParsed : 0;
+      const rightTs = Number.isFinite(rightParsed) ? rightParsed : 0;
       return rightTs - leftTs;
     });
   }, [filteredByYear]);
@@ -740,7 +749,21 @@ export function IndexPage() {
     setDragOffsetX(0);
   }
 
+  function applySwipeDelta(delta: number) {
+    resetCardDrag();
+
+    if (Math.abs(delta) < SWIPE_THRESHOLD) {
+      return;
+    }
+
+    void requestNextSummaryCard(delta > 0 ? "right" : "left");
+  }
+
   function handleSummaryCardPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "touch") {
+      return;
+    }
+
     if (!currentSummaryCard || activeSummaryDeck.isLoading) {
       return;
     }
@@ -751,6 +774,10 @@ export function IndexPage() {
   }
 
   function handleSummaryCardPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "touch") {
+      return;
+    }
+
     if (dragStartX === null) {
       return;
     }
@@ -758,18 +785,46 @@ export function IndexPage() {
   }
 
   function handleSummaryCardPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "touch") {
+      return;
+    }
+
     if (dragStartX === null) {
       return;
     }
 
     const delta = event.clientX - dragStartX;
-    resetCardDrag();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    applySwipeDelta(delta);
+  }
 
-    if (Math.abs(delta) < SWIPE_THRESHOLD) {
+  function handleSummaryCardTouchStart(event: ReactTouchEvent<HTMLDivElement>) {
+    if (!currentSummaryCard || activeSummaryDeck.isLoading || event.touches.length === 0) {
       return;
     }
 
-    void requestNextSummaryCard(delta > 0 ? "right" : "left");
+    setDragStartX(event.touches[0].clientX);
+    setDragOffsetX(0);
+  }
+
+  function handleSummaryCardTouchMove(event: ReactTouchEvent<HTMLDivElement>) {
+    if (dragStartX === null || event.touches.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    setDragOffsetX(event.touches[0].clientX - dragStartX);
+  }
+
+  function handleSummaryCardTouchEnd() {
+    if (dragStartX === null) {
+      return;
+    }
+
+    const delta = dragOffsetX;
+    applySwipeDelta(delta);
   }
 
   return (
@@ -906,6 +961,7 @@ export function IndexPage() {
                       {documentRows.map((document) => {
                         const transcriptUrl = pickTranscriptUrl(document);
                         const documentUrl = pickDocumentUrl(document);
+                        const publishedLabel = formatPublishedAt(document.published_at);
                         const isSelectedForChat = selectedChatDocument?.id === document.id;
                         const rowDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
                         const isRowSummaryLoading = Boolean(summaryDecksByKey[rowDeckKey]?.isLoading);
@@ -936,7 +992,7 @@ export function IndexPage() {
                               {document.quarter ? ` • ${document.quarter}` : ""}
                               {document.fiscal_year ? ` • ${document.fiscal_year}` : ""}
                             </p>
-                            <p className="text-[10px] text-slate-500">{formatPublishedAt(document.published_at)}</p>
+                            {publishedLabel ? <p className="text-[10px] text-slate-500">{publishedLabel}</p> : null}
 
                             <div className="mt-1.5 flex flex-wrap gap-1">
                               <Button
@@ -1064,7 +1120,7 @@ export function IndexPage() {
                         </div>
 
                         <article
-                          className="relative select-none touch-pan-y rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                          className="relative select-none touch-none rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
                           style={{
                             transform: `translateX(${dragOffsetX}px) rotate(${dragOffsetX / 24}deg)`,
                             transition: dragStartX === null ? "transform 180ms ease" : "none",
@@ -1073,12 +1129,16 @@ export function IndexPage() {
                           onPointerMove={handleSummaryCardPointerMove}
                           onPointerUp={handleSummaryCardPointerEnd}
                           onPointerCancel={handleSummaryCardPointerEnd}
+                          onTouchStart={handleSummaryCardTouchStart}
+                          onTouchMove={handleSummaryCardTouchMove}
+                          onTouchEnd={handleSummaryCardTouchEnd}
+                          onTouchCancel={handleSummaryCardTouchEnd}
                         >
                           <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700">
-                            Swipe left: simplify
+                            Swipe left: new perspective
                           </div>
                           <div className="pointer-events-none absolute right-3 top-3 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                            Swipe right: go deeper
+                            Swipe right: deeper from report
                           </div>
 
                           <div className="pt-7">

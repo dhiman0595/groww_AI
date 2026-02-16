@@ -36,11 +36,51 @@ function inferCompanyName(raw) {
   return raw.symbol || "Unknown";
 }
 
+function normalizePublishedAtValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  const raw = `${value}`.trim();
+  if (!raw) {
+    return "";
+  }
+
+  let parsed;
+  const isNumeric = /^-?\d+(?:\.\d+)?$/.test(raw);
+  if (isNumeric) {
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) {
+      return "";
+    }
+    const asMillis = Math.abs(numeric) < 1_000_000_000_000 ? numeric * 1000 : numeric;
+    parsed = new Date(asMillis);
+  } else {
+    parsed = new Date(raw);
+  }
+
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  if (parsed.getUTCFullYear() <= 1971) {
+    return "";
+  }
+
+  return parsed.toISOString();
+}
+
 function inferPublishedAt(raw) {
-  if (raw.provider === "NSE") return raw.published_at || "1970-01-01T00:00:00.000Z";
-  if (raw.provider === "BSE") return raw.posted_at || "1970-01-01T00:00:00.000Z";
-  if (raw.provider === "SEBI") return raw.filed_on || "1970-01-01T00:00:00.000Z";
-  return "1970-01-01T00:00:00.000Z";
+  if (raw.provider === "NSE") {
+    return normalizePublishedAtValue(raw.published_at || raw.published_date || raw.published_on || raw.date || raw.timestamp);
+  }
+  if (raw.provider === "BSE") {
+    return normalizePublishedAtValue(raw.posted_at || raw.published_at || raw.date || raw.timestamp);
+  }
+  if (raw.provider === "SEBI") {
+    return normalizePublishedAtValue(raw.filed_on || raw.published_at || raw.date || raw.timestamp);
+  }
+  return normalizePublishedAtValue(raw.published_at || raw.posted_at || raw.filed_on || raw.date || raw.timestamp);
 }
 
 function inferSearchText(raw) {
@@ -76,7 +116,7 @@ function matchesDocType(raw, docTypeFilter) {
 function withinDateRange(raw, from, to) {
   const published = new Date(inferPublishedAt(raw)).getTime();
   if (!Number.isFinite(published)) {
-    return false;
+    return !from && !to;
   }
 
   if (from) {
@@ -100,8 +140,10 @@ function sortRawDocuments(rawItems, sortOrder) {
   const mode = sortOrder === "oldest" ? "oldest" : "newest";
 
   return [...rawItems].sort((left, right) => {
-    const leftTs = new Date(inferPublishedAt(left)).getTime();
-    const rightTs = new Date(inferPublishedAt(right)).getTime();
+    const leftParsed = new Date(inferPublishedAt(left)).getTime();
+    const rightParsed = new Date(inferPublishedAt(right)).getTime();
+    const leftTs = Number.isFinite(leftParsed) ? leftParsed : 0;
+    const rightTs = Number.isFinite(rightParsed) ? rightParsed : 0;
 
     if (mode === "oldest") {
       return leftTs - rightTs;
@@ -136,6 +178,7 @@ module.exports = {
   inferSymbol,
   inferSearchText,
   inferPublishedAt,
+  normalizePublishedAtValue,
   matchesDocType,
   withinDateRange,
   sortRawDocuments,

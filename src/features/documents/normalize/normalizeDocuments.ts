@@ -22,13 +22,25 @@ function stableHash(seed: string): string {
 }
 
 function normalizeIsoDate(value: string | undefined): string {
-  if (!value) {
-    return new Date(0).toISOString();
+  if (!value?.trim()) {
+    return "";
   }
 
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return new Date(0).toISOString();
+  const raw = value.trim();
+  let parsed: Date;
+  if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) {
+      return "";
+    }
+    const asMillis = Math.abs(numeric) < 1_000_000_000_000 ? numeric * 1000 : numeric;
+    parsed = new Date(asMillis);
+  } else {
+    parsed = new Date(raw);
+  }
+
+  if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() <= 1971) {
+    return "";
   }
 
   return parsed.toISOString();
@@ -159,7 +171,7 @@ export function normalizeRawDocument(raw: RawSourceDocument): CompanyDocument {
         symbol: "UNKNOWN",
         doc_type: "OTHER",
         title: "Unknown document",
-        published_at: new Date(0).toISOString(),
+        published_at: "",
         source_name: "Unknown",
         source_url: "",
       };
@@ -244,7 +256,7 @@ function matchesQuery(doc: CompanyDocument, query: string | undefined): boolean 
 function matchesDateRange(doc: CompanyDocument, from?: string, to?: string): boolean {
   const published = new Date(doc.published_at).getTime();
   if (!Number.isFinite(published)) {
-    return false;
+    return !from && !to;
   }
 
   if (from) {
@@ -266,8 +278,10 @@ function matchesDateRange(doc: CompanyDocument, from?: string, to?: string): boo
 
 function sortDocuments(documents: CompanyDocument[], order: SortOrder = "newest"): CompanyDocument[] {
   return [...documents].sort((left, right) => {
-    const leftTs = new Date(left.published_at).getTime();
-    const rightTs = new Date(right.published_at).getTime();
+    const leftParsed = new Date(left.published_at).getTime();
+    const rightParsed = new Date(right.published_at).getTime();
+    const leftTs = Number.isFinite(leftParsed) ? leftParsed : 0;
+    const rightTs = Number.isFinite(rightParsed) ? rightParsed : 0;
 
     if (order === "oldest") {
       return leftTs - rightTs;
