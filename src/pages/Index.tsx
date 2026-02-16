@@ -15,7 +15,7 @@ import {
 import { CompanySelector } from "@/features/documents/components/CompanySelector";
 import { useCompaniesQuery } from "@/features/documents/state/useCompaniesQuery";
 import { useDocumentsQuery } from "@/features/documents/state/useDocumentsQuery";
-import type { CompanyDocument } from "@/features/documents/types";
+import type { CompanyDocument, DocumentTypeFilter } from "@/features/documents/types";
 
 interface ChatMessage {
   id: string;
@@ -50,6 +50,14 @@ const ROW_DOC_TYPES = new Set<CompanyDocument["doc_type"]>([
 ]);
 const SUMMARY_DECK_STORAGE_PREFIX = "summary-cards-v1";
 const SWIPE_THRESHOLD = 70;
+const FILINGS_DOC_TYPE_OPTIONS: Array<{ value: DocumentTypeFilter; label: string }> = [
+  { value: "ALL", label: "All documents" },
+  { value: "annual-report", label: "Annual Report" },
+  { value: "quarterly-result", label: "Quarterly Result" },
+  { value: "earnings-transcript", label: "Earnings Transcript" },
+  { value: "investor-presentation", label: "Investor Presentation" },
+  { value: "announcement", label: "Announcement" },
+];
 
 function createEmptySession(): ChatSessionState {
   return {
@@ -278,6 +286,7 @@ export function IndexPage() {
   const [sessionsBySymbol, setSessionsBySymbol] = useState<Record<string, ChatSessionState>>({});
   const [summaryDecksByKey, setSummaryDecksByKey] = useState<Record<string, SummaryDeckState>>({});
   const [selectedYearBySymbol, setSelectedYearBySymbol] = useState<Record<string, string>>({});
+  const [selectedDocTypeBySymbol, setSelectedDocTypeBySymbol] = useState<Record<string, DocumentTypeFilter>>({});
   const [selectedDocIdBySymbol, setSelectedDocIdBySymbol] = useState<Record<string, string>>({});
   const [summaryView, setSummaryView] = useState<SummaryViewState | null>(null);
   const [dragStartX, setDragStartX] = useState<number | null>(null);
@@ -298,8 +307,10 @@ export function IndexPage() {
     [companiesQuery.data, effectiveSelectedSymbol]
   );
 
+  const selectedDocumentType = selectedDocTypeBySymbol[effectiveSelectedSymbol] ?? "ALL";
   const documentsQuery = useDocumentsQuery({
     symbol: effectiveSelectedSymbol,
+    doc_type: selectedDocumentType,
     page: 1,
     page_size: 120,
   });
@@ -336,6 +347,23 @@ export function IndexPage() {
       };
     });
   }, [effectiveSelectedSymbol, yearOptions]);
+
+  useEffect(() => {
+    if (!effectiveSelectedSymbol) {
+      return;
+    }
+
+    setSelectedDocTypeBySymbol((previous) => {
+      if (previous[effectiveSelectedSymbol]) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        [effectiveSelectedSymbol]: "ALL",
+      };
+    });
+  }, [effectiveSelectedSymbol]);
 
   useEffect(() => {
     setSummaryView(null);
@@ -782,10 +810,37 @@ export function IndexPage() {
                   </select>
                 </div>
 
+                <div className="space-y-1">
+                  <Label htmlFor="document-type-selection" className="text-xs text-slate-600">
+                    Document type
+                  </Label>
+                  <select
+                    id="document-type-selection"
+                    value={selectedDocumentType}
+                    onChange={(event) => {
+                      const nextType = event.target.value as DocumentTypeFilter;
+                      setSelectedDocTypeBySymbol((previous) => ({
+                        ...previous,
+                        [effectiveSelectedSymbol]: nextType,
+                      }));
+                      setSelectedDocIdBySymbol((previous) => ({
+                        ...previous,
+                        [effectiveSelectedSymbol]: "",
+                      }));
+                      setSummaryView(null);
+                    }}
+                    className="flex h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
+                  >
+                    {FILINGS_DOC_TYPE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 <div className="space-y-2">
-                  <p className="text-xs font-medium text-slate-600">
-                    Filings feed (Concall / Quarterly / DRHP-RHP)
-                  </p>
+                  <p className="text-xs font-medium text-slate-600">Filings feed</p>
                   <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
                     {documentsQuery.isLoading ? (
                       <p className="text-xs text-slate-500">Loading filings...</p>
@@ -1029,10 +1084,6 @@ export function IndexPage() {
                             I understand, go deeper
                           </Button>
                         </div>
-
-                        <p className="text-[11px] text-slate-500">
-                          Swipe the card or tap buttons: left for simpler explanation, right for deeper analysis.
-                        </p>
 
                         {summarySources.length > 0 ? (
                           <div className="flex flex-wrap gap-1.5">

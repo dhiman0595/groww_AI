@@ -38,10 +38,16 @@ export type SortOrder = "newest" | "oldest";
 
 export type DocumentTypeFilter =
   | "ALL"
+  | "annual-report"
+  | "quarterly-result"
+  | "earnings-transcript"
+  | "investor-presentation"
+  | "announcement"
   | "QUARTERLY_RESULT"
   | "ANNOUNCEMENT"
   | "DRHP_RHP"
-  | "CONCALL_TRANSCRIPT";
+  | "CONCALL_TRANSCRIPT"
+  | "INVESTOR_PRESENTATION";
 
 export interface DocumentsQueryParams {
   symbol: string;

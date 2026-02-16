@@ -194,6 +194,26 @@ function matchesTypeFilter(doc: CompanyDocument, filter: DocumentTypeFilter | un
     return true;
   }
 
+  if (filter === "annual-report") {
+    return doc.doc_type === "OTHER";
+  }
+
+  if (filter === "quarterly-result") {
+    return doc.doc_type === "QUARTERLY_RESULT";
+  }
+
+  if (filter === "earnings-transcript") {
+    return doc.doc_type === "CONCALL_TRANSCRIPT";
+  }
+
+  if (filter === "investor-presentation") {
+    return doc.doc_type === "INVESTOR_PRESENTATION";
+  }
+
+  if (filter === "announcement") {
+    return doc.doc_type === "ANNOUNCEMENT";
+  }
+
   if (filter === "DRHP_RHP") {
     return doc.doc_type === "DRHP" || doc.doc_type === "RHP" || doc.doc_type === "OFFER_DOCUMENT";
   }

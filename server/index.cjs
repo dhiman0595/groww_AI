@@ -7,6 +7,11 @@ const { fetchNseDocuments } = require("./adapters/nseAdapter.cjs");
 const { fetchBseDocuments } = require("./adapters/bseAdapter.cjs");
 const { fetchSebiDocuments } = require("./adapters/sebiAdapter.cjs");
 const {
+  fetchFilingsFeedDocuments,
+  hasFilingsFeedConfig,
+  normalizeRequestedType,
+} = require("./adapters/filingsFeedAdapter.cjs");
+const {
   buildCompanies,
   inferDocumentType,
   inferPublishedAt,
@@ -31,11 +36,41 @@ const SUMMARY_REGEX = /\b(summary|summarize|deep analysis|analysis|overview|dige
 app.use(cors());
 app.use(express.json());
 
-async function loadRawDocuments(symbol) {
+function toInternalDocTypeFilter(rawValue) {
+  const raw = `${rawValue || "ALL"}`.trim();
+  if (!raw || raw.toUpperCase() === "ALL") {
+    return "ALL";
+  }
+
+  const lower = raw.toLowerCase();
+  if (lower === "quarterly-result") return "QUARTERLY_RESULT";
+  if (lower === "announcement") return "ANNOUNCEMENT";
+  if (lower === "earnings-transcript") return "CONCALL_TRANSCRIPT";
+  if (lower === "investor-presentation") return "INVESTOR_PRESENTATION";
+  if (lower === "annual-report") return "OTHER";
+
+  return raw.toUpperCase();
+}
+
+async function loadRawDocuments(symbol, options = {}) {
+  const normalizedSymbol = `${symbol || ""}`.trim().toUpperCase();
+  const requestedType = normalizeRequestedType(options.documentType || "ALL");
+
+  if (normalizedSymbol) {
+    const filingsFeedDocuments = await fetchFilingsFeedDocuments({
+      symbol: normalizedSymbol,
+      documentType: requestedType,
+    });
+
+    if (filingsFeedDocuments.length > 0 || hasFilingsFeedConfig()) {
+      return filingsFeedDocuments;
+    }
+  }
+
   const [nseLive, bseLive, sebiLive] = await Promise.all([
-    fetchNseDocuments(symbol),
-    fetchBseDocuments(symbol),
-    fetchSebiDocuments(symbol),
+    fetchNseDocuments(normalizedSymbol),
+    fetchBseDocuments(normalizedSymbol),
+    fetchSebiDocuments(normalizedSymbol),
   ]);
 
   const nse = nseLive.length > 0 ? nseLive : MOCK_SOURCE_FIXTURES.nse;
@@ -924,6 +959,8 @@ app.get("/api/documents", async (req, res) => {
   try {
     const symbol = `${req.query.symbol || ""}`.trim().toUpperCase();
     const docType = `${req.query.doc_type || "ALL"}`.trim();
+    const internalDocType = toInternalDocTypeFilter(docType);
+    const normalizedRequestedType = normalizeRequestedType(docType);
     const q = `${req.query.q || ""}`.trim().toLowerCase();
     const from = `${req.query.from || ""}`.trim();
     const to = `${req.query.to || ""}`.trim();
@@ -936,11 +973,13 @@ app.get("/api/documents", async (req, res) => {
       return;
     }
 
-    const rawItems = await loadRawDocuments(symbol);
+    const rawItems = await loadRawDocuments(symbol, {
+      documentType: normalizedRequestedType,
+    });
 
     const filtered = rawItems
       .filter((item) => inferSymbol(item) === symbol)
-      .filter((item) => matchesDocType(item, docType))
+      .filter((item) => matchesDocType(item, internalDocType))
       .filter((item) => withinDateRange(item, from || undefined, to || undefined))
       .filter((item) => {
         if (!q) {
