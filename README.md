@@ -96,3 +96,11 @@ STOCKINSIGHTS_COMPANY_PARAM=symbol
 ```
 
 The frontend document-type dropdown passes the selected type and backend calls this API using `document_type`.
+
+### Troubleshooting company dropdown
+
+If you still see only a small hardcoded set of companies, check:
+
+1. `VITE_DOCS_MODE=real` in frontend env.
+2. `DATABASE_URL` is set on backend.
+3. `companies_master` has been imported (`npm run import:companies -- <path-to-ISIN_mapping.json> --replace`).

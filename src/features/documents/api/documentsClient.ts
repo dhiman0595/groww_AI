@@ -13,11 +13,11 @@ import type {
   RawSourceDocument,
 } from "@/features/documents/types";
 
-const DOCS_MODE = (import.meta.env.VITE_DOCS_MODE ?? "mock").trim().toLowerCase();
+const DOCS_MODE = (import.meta.env.VITE_DOCS_MODE ?? "real").trim().toLowerCase();
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 
 function isMockMode(): boolean {
-  return DOCS_MODE !== "real";
+  return DOCS_MODE === "mock";
 }
 
 function withBaseUrl(pathname: string): string {
@@ -69,7 +69,16 @@ export async function fetchCompanies(query?: string): Promise<CompanyOption[]> {
   const response = await fetch(endpoint);
 
   if (!response.ok) {
-    throw new Error("Failed to load companies from API.");
+    let message = "Failed to load companies from API.";
+    try {
+      const payload = (await response.json()) as { error?: string };
+      if (payload.error) {
+        message = payload.error;
+      }
+    } catch {
+      // Keeps default message when response body is not available.
+    }
+    throw new Error(message);
   }
 
   const payload = (await response.json()) as RawCompaniesResponse;

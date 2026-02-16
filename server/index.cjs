@@ -12,7 +12,6 @@ const {
   normalizeRequestedType,
 } = require("./adapters/filingsFeedAdapter.cjs");
 const {
-  buildCompanies,
   inferDocumentType,
   inferPublishedAt,
   inferSearchText,
@@ -21,7 +20,7 @@ const {
   sortRawDocuments,
   withinDateRange,
 } = require("./utils/documentHelpers.cjs");
-const { fetchCompaniesFromMaster } = require("./db/companiesMaster.cjs");
+const { fetchCompaniesFromMaster, hasMasterDatabase } = require("./db/companiesMaster.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
 const GEMINI_API_KEY = `${process.env.GEMINI_API_KEY || ""}`.trim();
@@ -931,25 +930,23 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/companies", async (req, res) => {
   try {
     const query = `${req.query.query || ""}`.trim().toLowerCase();
+    if (!hasMasterDatabase()) {
+      res.status(500).json({
+        error:
+          "Companies master is not configured. Set DATABASE_URL and import ISIN mapping into companies_master.",
+      });
+      return;
+    }
+
     const masterCompanies = await fetchCompaniesFromMaster({ query, limit: 120 });
 
     if (Array.isArray(masterCompanies)) {
       res.json({ companies: masterCompanies });
       return;
     }
-
-    const rawItems = await loadRawDocuments();
-
-    const companies = buildCompanies(rawItems).filter((company) => {
-      if (!query) {
-        return true;
-      }
-
-      const text = `${company.company_name} ${company.symbol} ${company.isin || ""}`.toLowerCase();
-      return text.includes(query);
+    res.status(503).json({
+      error: "Companies master is temporarily unavailable. Check database connectivity.",
     });
-
-    res.json({ companies });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch companies." });
   }
