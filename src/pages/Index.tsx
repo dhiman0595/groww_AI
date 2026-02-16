@@ -1,11 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { ArrowLeft, SendHorizontal, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { fetchChatAnswer, type ChatSource } from "@/features/documents/api/chatClient";
+import {
+  fetchChatAnswer,
+  fetchSummaryCardsInit,
+  fetchSummaryCardsNext,
+  type ChatSource,
+  type SummaryCard,
+} from "@/features/documents/api/chatClient";
 import { CompanySelector } from "@/features/documents/components/CompanySelector";
 import { useCompaniesQuery } from "@/features/documents/state/useCompaniesQuery";
 import { useDocumentsQuery } from "@/features/documents/state/useDocumentsQuery";
@@ -27,6 +33,14 @@ interface SummaryViewState {
   docId: string;
 }
 
+interface SummaryDeckState {
+  cards: SummaryCard[];
+  currentIndex: number;
+  isLoading: boolean;
+  error: string | null;
+  sources: ChatSource[];
+}
+
 const ROW_DOC_TYPES = new Set<CompanyDocument["doc_type"]>([
   "CONCALL_TRANSCRIPT",
   "QUARTERLY_RESULT",
@@ -34,11 +48,23 @@ const ROW_DOC_TYPES = new Set<CompanyDocument["doc_type"]>([
   "RHP",
   "OFFER_DOCUMENT",
 ]);
+const SUMMARY_DECK_STORAGE_PREFIX = "summary-cards-v1";
+const SWIPE_THRESHOLD = 70;
 
 function createEmptySession(): ChatSessionState {
   return {
     messages: [],
     followUpQuestions: [],
+  };
+}
+
+function createEmptyDeck(): SummaryDeckState {
+  return {
+    cards: [],
+    currentIndex: 0,
+    isLoading: false,
+    error: null,
+    sources: [],
   };
 }
 
@@ -161,22 +187,101 @@ function pickTranscriptUrl(document: CompanyDocument): string {
   return document.file_url || document.source_url;
 }
 
-function toSummarySessionKey(symbol: string, docId: string): string {
-  return `${symbol}::${docId}`;
+function toSummaryDeckKey(symbol: string, docId: string): string {
+  return `${SUMMARY_DECK_STORAGE_PREFIX}::${symbol}::${docId}`;
+}
+
+function sanitizeSummaryCard(card: SummaryCard): SummaryCard {
+  return {
+    id: `${card.id || createMessageId()}`,
+    concept: `${card.concept || "Concept"}`.trim(),
+    title: `${card.title || "Summary card"}`.trim(),
+    explanation: `${card.explanation || ""}`.trim(),
+    why_it_matters: `${card.why_it_matters || ""}`.trim(),
+    example: `${card.example || ""}`.trim(),
+    level: Math.max(1, Math.min(5, Number(card.level) || 1)),
+    source_refs: Array.isArray(card.source_refs) ? card.source_refs : [],
+  };
+}
+
+function loadDeckFromStorage(storageKey: string): SummaryDeckState | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as {
+      cards?: SummaryCard[];
+      currentIndex?: number;
+      sources?: ChatSource[];
+    };
+
+    const cards = Array.isArray(parsed.cards)
+      ? parsed.cards.map((card) => sanitizeSummaryCard(card)).filter((card) => card.title && card.explanation)
+      : [];
+
+    if (cards.length === 0) {
+      return null;
+    }
+
+    const index = Number.isFinite(parsed.currentIndex)
+      ? Math.max(0, Math.min(cards.length - 1, Number(parsed.currentIndex)))
+      : 0;
+
+    return {
+      cards,
+      currentIndex: index,
+      isLoading: false,
+      error: null,
+      sources: Array.isArray(parsed.sources) ? parsed.sources : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistDeck(storageKey: string, deck: SummaryDeckState): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify({
+        cards: deck.cards,
+        currentIndex: deck.currentIndex,
+        sources: deck.sources,
+      })
+    );
+  } catch {
+    // Persists best-effort without blocking the UI.
+  }
+}
+
+function mergeUniqueCards(existingCards: SummaryCard[], incomingCards: SummaryCard[]): SummaryCard[] {
+  const byId = new Set(existingCards.map((card) => card.id));
+  const appended = incomingCards.filter((card) => !byId.has(card.id));
+  return appended.length > 0 ? [...existingCards, ...appended] : existingCards;
 }
 
 export function IndexPage() {
   const [companySearchText, setCompanySearchText] = useState("");
   const [selectedSymbol, setSelectedSymbol] = useState("");
   const [draftQuestion, setDraftQuestion] = useState("");
-  const [summaryDraft, setSummaryDraft] = useState("");
   const [isAsking, setIsAsking] = useState(false);
-  const [isSummaryAsking, setIsSummaryAsking] = useState(false);
   const [sessionsBySymbol, setSessionsBySymbol] = useState<Record<string, ChatSessionState>>({});
-  const [summarySessionsByKey, setSummarySessionsByKey] = useState<Record<string, ChatSessionState>>({});
+  const [summaryDecksByKey, setSummaryDecksByKey] = useState<Record<string, SummaryDeckState>>({});
   const [selectedYearBySymbol, setSelectedYearBySymbol] = useState<Record<string, string>>({});
   const [selectedDocIdBySymbol, setSelectedDocIdBySymbol] = useState<Record<string, string>>({});
   const [summaryView, setSummaryView] = useState<SummaryViewState | null>(null);
+  const [dragStartX, setDragStartX] = useState<number | null>(null);
+  const [dragOffsetX, setDragOffsetX] = useState(0);
 
   const companiesQuery = useCompaniesQuery(companySearchText);
   const effectiveSelectedSymbol = selectedSymbol.trim().toUpperCase();
@@ -234,7 +339,8 @@ export function IndexPage() {
 
   useEffect(() => {
     setSummaryView(null);
-    setSummaryDraft("");
+    setDragStartX(null);
+    setDragOffsetX(0);
   }, [effectiveSelectedSymbol]);
 
   const selectedYear = selectedYearBySymbol[effectiveSelectedSymbol] ?? "ALL";
@@ -315,13 +421,13 @@ export function IndexPage() {
     ];
   }, [activeSession.followUpQuestions, selectedCompany, selectedYear]);
 
-  const summarySessionKey = summaryView
-    ? toSummarySessionKey(effectiveSelectedSymbol, summaryView.docId)
-    : "";
-  const activeSummarySession =
-    summarySessionKey.length > 0
-      ? summarySessionsByKey[summarySessionKey] ?? createEmptySession()
-      : createEmptySession();
+  const summaryDeckKey = summaryView ? toSummaryDeckKey(effectiveSelectedSymbol, summaryView.docId) : "";
+  const activeSummaryDeck =
+    summaryDeckKey.length > 0 ? summaryDecksByKey[summaryDeckKey] ?? createEmptyDeck() : createEmptyDeck();
+  const currentSummaryCard = activeSummaryDeck.cards[activeSummaryDeck.currentIndex] ?? null;
+  const summarySources = currentSummaryCard?.source_refs.length
+    ? currentSummaryCard.source_refs
+    : activeSummaryDeck.sources;
 
   const summaryDocument = useMemo(() => {
     if (!summaryView) {
@@ -329,6 +435,13 @@ export function IndexPage() {
     }
     return documentRows.find((document) => document.id === summaryView.docId) ?? null;
   }, [documentRows, summaryView]);
+
+  useEffect(() => {
+    if (!summaryDeckKey || !activeSummaryDeck.cards.length || activeSummaryDeck.isLoading) {
+      return;
+    }
+    persistDeck(summaryDeckKey, activeSummaryDeck);
+  }, [activeSummaryDeck, summaryDeckKey]);
 
   async function submitMainQuestion(rawQuestion: string, options?: { docIds?: string[] }) {
     if (!effectiveSelectedSymbol || isAsking) {
@@ -436,167 +549,180 @@ export function IndexPage() {
   }
 
   async function openSummaryView(document: CompanyDocument) {
-    if (!effectiveSelectedSymbol || isSummaryAsking) {
-      setSummaryView({ docId: document.id });
-      return;
-    }
-
     setSummaryView({ docId: document.id });
-    setSummaryDraft("");
+    setDragStartX(null);
+    setDragOffsetX(0);
 
-    const nextSessionKey = toSummarySessionKey(effectiveSelectedSymbol, document.id);
-    const existing = summarySessionsByKey[nextSessionKey];
-    if (existing && existing.messages.length > 0) {
+    if (!effectiveSelectedSymbol) {
       return;
     }
 
-    setIsSummaryAsking(true);
+    const nextDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
+    const existingDeck = summaryDecksByKey[nextDeckKey];
+    if (existingDeck?.cards.length || existingDeck?.isLoading) {
+      return;
+    }
+
+    const cachedDeck = loadDeckFromStorage(nextDeckKey);
+    if (cachedDeck) {
+      setSummaryDecksByKey((previous) => ({
+        ...previous,
+        [nextDeckKey]: cachedDeck,
+      }));
+      return;
+    }
+
+    setSummaryDecksByKey((previous) => ({
+      ...previous,
+      [nextDeckKey]: {
+        ...createEmptyDeck(),
+        isLoading: true,
+      },
+    }));
 
     try {
-      const response = await fetchChatAnswer({
+      const response = await fetchSummaryCardsInit({
         symbol: effectiveSelectedSymbol,
         company_name: selectedCompany?.company_name,
-        question:
-          "Give me a deep summary of this selected document. Include business model, key metrics, management commentary versus numbers, risks, and what is often ignored.",
         year: selectedYear === "ALL" ? undefined : selectedYear,
         doc_ids: [document.id],
-        history: [],
       });
 
-      const assistantMessage: ChatMessage = {
-        id: createMessageId(),
-        role: "assistant",
-        content: response.answer,
-        sources: response.sources,
-      };
+      const cards = response.cards
+        .map((card) => sanitizeSummaryCard(card))
+        .filter((card) => card.title && card.explanation);
 
-      setSummarySessionsByKey((previous) => ({
+      setSummaryDecksByKey((previous) => ({
         ...previous,
-        [nextSessionKey]: {
-          messages: [assistantMessage],
-          followUpQuestions: response.follow_up_questions,
+        [nextDeckKey]: {
+          cards,
+          currentIndex: 0,
+          isLoading: false,
+          error: cards.length > 0 ? null : "No AI cards were generated for this document yet.",
+          sources: response.sources,
         },
       }));
     } catch (error) {
-      const assistantMessage: ChatMessage = {
-        id: createMessageId(),
-        role: "assistant",
-        content:
-          error instanceof Error
-            ? error.message
-            : "Could not load summary for this document right now.",
-        sources: [],
-      };
-
-      setSummarySessionsByKey((previous) => ({
+      setSummaryDecksByKey((previous) => ({
         ...previous,
-        [nextSessionKey]: {
-          messages: [assistantMessage],
-          followUpQuestions: [],
+        [nextDeckKey]: {
+          ...createEmptyDeck(),
+          isLoading: false,
+          error:
+            error instanceof Error ? error.message : "Could not generate summary cards for this document right now.",
         },
       }));
-    } finally {
-      setIsSummaryAsking(false);
     }
   }
 
-  async function submitSummaryQuestion(rawQuestion: string) {
-    if (!effectiveSelectedSymbol || !summaryView || isSummaryAsking) {
+  async function requestNextSummaryCard(swipeDirection: "left" | "right") {
+    if (!effectiveSelectedSymbol || !summaryView || !summaryDeckKey || !currentSummaryCard) {
       return;
     }
 
-    const question = rawQuestion.trim();
-    if (!question) {
+    if (activeSummaryDeck.isLoading) {
       return;
     }
 
-    const currentSession = summarySessionsByKey[summarySessionKey] ?? createEmptySession();
-    const conversationHistory = [
-      ...currentSession.messages.slice(-6).map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-      {
-        role: "user" as const,
-        content: question,
-      },
-    ];
-
-    const userMessage: ChatMessage = {
-      id: createMessageId(),
-      role: "user",
-      content: question,
-      sources: [],
-    };
-
-    setSummarySessionsByKey((previous) => {
-      const existing = previous[summarySessionKey] ?? createEmptySession();
+    setSummaryDecksByKey((previous) => {
+      const existing = previous[summaryDeckKey] ?? createEmptyDeck();
       return {
         ...previous,
-        [summarySessionKey]: {
+        [summaryDeckKey]: {
           ...existing,
-          messages: [...existing.messages, userMessage],
+          isLoading: true,
+          error: null,
         },
       };
     });
 
-    setSummaryDraft("");
-    setIsSummaryAsking(true);
-
     try {
-      const response = await fetchChatAnswer({
+      const response = await fetchSummaryCardsNext({
         symbol: effectiveSelectedSymbol,
         company_name: selectedCompany?.company_name,
-        question,
         year: selectedYear === "ALL" ? undefined : selectedYear,
         doc_ids: [summaryView.docId],
-        history: conversationHistory,
+        swipe_direction: swipeDirection,
+        current_card: {
+          concept: currentSummaryCard.concept,
+          title: currentSummaryCard.title,
+          level: currentSummaryCard.level,
+        },
       });
 
-      const assistantMessage: ChatMessage = {
-        id: createMessageId(),
-        role: "assistant",
-        content: response.answer,
-        sources: response.sources,
-      };
+      const incomingCards = response.cards
+        .map((card) => sanitizeSummaryCard(card))
+        .filter((card) => card.title && card.explanation);
 
-      setSummarySessionsByKey((previous) => {
-        const existing = previous[summarySessionKey] ?? createEmptySession();
+      setSummaryDecksByKey((previous) => {
+        const existing = previous[summaryDeckKey] ?? createEmptyDeck();
+        let cards = mergeUniqueCards(existing.cards, incomingCards);
+        if (cards.length === existing.cards.length && incomingCards[0]) {
+          cards = [...existing.cards, { ...incomingCards[0], id: createMessageId() }];
+        }
+
+        const nextIndex = cards.length > 0 ? cards.length - 1 : 0;
         return {
           ...previous,
-          [summarySessionKey]: {
-            messages: [...existing.messages, assistantMessage],
-            followUpQuestions:
-              response.follow_up_questions.length > 0
-                ? response.follow_up_questions
-                : existing.followUpQuestions,
+          [summaryDeckKey]: {
+            cards,
+            currentIndex: nextIndex,
+            isLoading: false,
+            error: cards.length > 0 ? null : "No follow-up card could be generated.",
+            sources: response.sources.length > 0 ? response.sources : existing.sources,
           },
         };
       });
     } catch (error) {
-      const assistantMessage: ChatMessage = {
-        id: createMessageId(),
-        role: "assistant",
-        content:
-          error instanceof Error
-            ? error.message
-            : "Could not answer this summary question right now.",
-        sources: [],
-      };
-
-      setSummarySessionsByKey((previous) => {
-        const existing = previous[summarySessionKey] ?? createEmptySession();
+      setSummaryDecksByKey((previous) => {
+        const existing = previous[summaryDeckKey] ?? createEmptyDeck();
         return {
           ...previous,
-          [summarySessionKey]: {
+          [summaryDeckKey]: {
             ...existing,
-            messages: [...existing.messages, assistantMessage],
+            isLoading: false,
+            error: error instanceof Error ? error.message : "Could not generate the next card right now.",
           },
         };
       });
-    } finally {
-      setIsSummaryAsking(false);
     }
+  }
+
+  function resetCardDrag() {
+    setDragStartX(null);
+    setDragOffsetX(0);
+  }
+
+  function handleSummaryCardPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!currentSummaryCard || activeSummaryDeck.isLoading) {
+      return;
+    }
+
+    setDragStartX(event.clientX);
+    setDragOffsetX(0);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleSummaryCardPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (dragStartX === null) {
+      return;
+    }
+    setDragOffsetX(event.clientX - dragStartX);
+  }
+
+  function handleSummaryCardPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
+    if (dragStartX === null) {
+      return;
+    }
+
+    const delta = event.clientX - dragStartX;
+    resetCardDrag();
+
+    if (Math.abs(delta) < SWIPE_THRESHOLD) {
+      return;
+    }
+
+    void requestNextSummaryCard(delta > 0 ? "right" : "left");
   }
 
   return (
@@ -678,6 +804,8 @@ export function IndexPage() {
                       const transcriptUrl = pickTranscriptUrl(document);
                       const documentUrl = pickDocumentUrl(document);
                       const isSelectedForChat = selectedChatDocument?.id === document.id;
+                      const rowDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
+                      const isRowSummaryLoading = Boolean(summaryDecksByKey[rowDeckKey]?.isLoading);
 
                       return (
                         <article
@@ -765,7 +893,7 @@ export function IndexPage() {
                               type="button"
                               variant="outline"
                               className="h-7 border-emerald-300 px-2 text-[11px] text-emerald-700 hover:bg-emerald-50"
-                              disabled={isSummaryAsking}
+                              disabled={isRowSummaryLoading}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 setSelectedDocIdBySymbol((previous) => ({
@@ -775,7 +903,7 @@ export function IndexPage() {
                                 void openSummaryView(document);
                               }}
                             >
-                              AI Summary
+                              {isRowSummaryLoading ? "Loading..." : "AI Summary"}
                             </Button>
                           </div>
                         </article>
@@ -808,51 +936,114 @@ export function IndexPage() {
                   </p>
                 </div>
 
-                {activeSummarySession.followUpQuestions.length > 0 ? (
-                  <div className="border-b border-slate-200 bg-white px-3 py-2">
-                    <div className="flex gap-2 overflow-x-auto pb-1">
-                      {activeSummarySession.followUpQuestions.map((suggestion) => (
-                        <div key={suggestion} className="group relative shrink-0">
-                          <button
-                            type="button"
-                            className="h-8 rounded-full border border-slate-200 bg-white px-3 text-xs text-slate-700 transition hover:border-emerald-300 hover:text-emerald-700"
-                            disabled={isSummaryAsking}
-                            onClick={() => {
-                              void submitSummaryQuestion(suggestion);
-                            }}
-                          >
-                            {truncateSuggestion(suggestion)}
-                          </button>
-                          <div className="pointer-events-none absolute left-1/2 top-0 z-20 hidden w-64 -translate-x-1/2 -translate-y-[110%] rounded-lg border border-emerald-100 bg-emerald-50 p-2 text-xs leading-relaxed text-slate-700 shadow-sm group-hover:block">
-                            {suggestion}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-
                 <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
                   <div className="space-y-3">
-                    {activeSummarySession.messages.map((message) => (
-                      <article
-                        key={message.id}
-                        className={`max-w-[86%] rounded-2xl p-3 text-sm shadow-sm ${
-                          message.role === "user"
-                            ? "ml-auto rounded-br-md bg-emerald-500 text-white"
-                            : "mr-auto rounded-bl-md border border-slate-200 bg-white text-slate-800"
-                        }`}
-                      >
-                        <p className="whitespace-pre-wrap leading-relaxed">{message.content}</p>
-                        {message.role === "assistant" && message.sources.length > 0 ? (
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            {message.sources.slice(0, 6).map((source) => {
+                    {activeSummaryDeck.error ? (
+                      <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                        {activeSummaryDeck.error}
+                      </div>
+                    ) : null}
+
+                    {!currentSummaryCard && activeSummaryDeck.isLoading ? (
+                      <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-500">
+                        <span className="size-1.5 rounded-full bg-emerald-500" />
+                        Building your first battle card...
+                      </div>
+                    ) : null}
+
+                    {currentSummaryCard ? (
+                      <>
+                        <div className="flex items-center justify-between text-[11px] text-slate-500">
+                          <span>
+                            Card {activeSummaryDeck.currentIndex + 1} of {activeSummaryDeck.cards.length}
+                          </span>
+                          <span>Depth level {currentSummaryCard.level}/5</span>
+                        </div>
+
+                        <article
+                          className="relative select-none touch-pan-y rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                          style={{
+                            transform: `translateX(${dragOffsetX}px) rotate(${dragOffsetX / 24}deg)`,
+                            transition: dragStartX === null ? "transform 180ms ease" : "none",
+                          }}
+                          onPointerDown={handleSummaryCardPointerDown}
+                          onPointerMove={handleSummaryCardPointerMove}
+                          onPointerUp={handleSummaryCardPointerEnd}
+                          onPointerCancel={handleSummaryCardPointerEnd}
+                        >
+                          <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700">
+                            Swipe left: simplify
+                          </div>
+                          <div className="pointer-events-none absolute right-3 top-3 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                            Swipe right: go deeper
+                          </div>
+
+                          <div className="pt-7">
+                            <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-emerald-700">
+                              {currentSummaryCard.concept}
+                            </Badge>
+                            <h3 className="mt-2 text-base font-semibold text-slate-900">{currentSummaryCard.title}</h3>
+                            <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
+                              {currentSummaryCard.explanation}
+                            </p>
+
+                            <div className="mt-3 rounded-lg border border-emerald-100 bg-emerald-50/60 p-2.5">
+                              <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
+                                Why it matters
+                              </p>
+                              <p className="mt-1 text-xs leading-relaxed text-slate-700">
+                                {currentSummaryCard.why_it_matters}
+                              </p>
+                            </div>
+
+                            <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5">
+                              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">
+                                Example
+                              </p>
+                              <p className="mt-1 text-xs leading-relaxed text-slate-700">{currentSummaryCard.example}</p>
+                            </div>
+                          </div>
+                        </article>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="h-10 border-rose-200 text-xs text-rose-700 hover:bg-rose-50"
+                            disabled={activeSummaryDeck.isLoading}
+                            onClick={() => {
+                              void requestNextSummaryCard("left");
+                            }}
+                          >
+                            I need simpler
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="h-10 border-emerald-200 text-xs text-emerald-700 hover:bg-emerald-50"
+                            disabled={activeSummaryDeck.isLoading}
+                            onClick={() => {
+                              void requestNextSummaryCard("right");
+                            }}
+                          >
+                            I understand, go deeper
+                          </Button>
+                        </div>
+
+                        <p className="text-[11px] text-slate-500">
+                          Swipe the card or tap buttons: left for simpler explanation, right for deeper analysis.
+                        </p>
+
+                        {summarySources.length > 0 ? (
+                          <div className="flex flex-wrap gap-1.5">
+                            {summarySources.slice(0, 8).map((source, index) => {
                               const hasLink = source.url && source.url.length > 0;
                               const label = source.title || source.source_name || "Source";
+                              const key = `${label}-${source.url || index}`;
 
                               return hasLink ? (
                                 <a
-                                  key={`${message.id}-${label}-${source.url}`}
+                                  key={key}
                                   href={source.url}
                                   target="_blank"
                                   rel="noreferrer"
@@ -862,7 +1053,7 @@ export function IndexPage() {
                                 </a>
                               ) : (
                                 <span
-                                  key={`${message.id}-${label}`}
+                                  key={key}
                                   className="rounded-full border border-slate-200 bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600"
                                 >
                                   {label}
@@ -871,38 +1062,17 @@ export function IndexPage() {
                             })}
                           </div>
                         ) : null}
-                      </article>
-                    ))}
+                      </>
+                    ) : null}
 
-                    {isSummaryAsking ? (
+                    {currentSummaryCard && activeSummaryDeck.isLoading ? (
                       <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-500">
                         <span className="size-1.5 rounded-full bg-emerald-500" />
-                        Thinking...
+                        Generating next card...
                       </div>
                     ) : null}
                   </div>
                 </div>
-
-                <form
-                  className="border-t border-slate-200 bg-white p-3"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void submitSummaryQuestion(summaryDraft);
-                  }}
-                >
-                  <div className="flex items-end gap-2">
-                    <Textarea
-                      value={summaryDraft}
-                      onChange={(event) => setSummaryDraft(event.target.value)}
-                      placeholder="Ask questions about this AI summary..."
-                      className="min-h-12 resize-none"
-                      rows={2}
-                    />
-                    <Button type="submit" size="icon" className="h-10 w-10 shrink-0" disabled={isSummaryAsking}>
-                      <SendHorizontal className="size-4" />
-                    </Button>
-                  </div>
-                </form>
               </>
             ) : (
               <>

@@ -440,6 +440,178 @@ function buildFollowUpQuestions({ companyName, year, quarter, topDocuments }) {
   return Array.from(new Set(suggested)).slice(0, 6);
 }
 
+function normalizeCardLevel(value, fallback = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(1, Math.min(5, Math.round(parsed)));
+}
+
+function createSummaryCardId(seed) {
+  return `card_${stableHash(`${seed}-${Date.now()}-${Math.random().toString(16).slice(2)}`)}`;
+}
+
+function buildContextLines(documents) {
+  return documents.map((document, index) => {
+    const quarterLine = document.quarter ? `Quarter: ${document.quarter}` : "Quarter: n/a";
+    const yearLine = document.fiscal_year ? `Fiscal year: ${document.fiscal_year}` : "Fiscal year: n/a";
+    return [
+      `[${index + 1}] ${document.title}`,
+      `Type: ${document.doc_type}`,
+      quarterLine,
+      yearLine,
+      `Published: ${document.published_at}`,
+      `Source: ${document.source_name}`,
+      `Summary: ${document.description || "No summary available."}`,
+    ].join("\n");
+  });
+}
+
+function normalizeCardSources(rawSources, fallbackDocument) {
+  if (Array.isArray(rawSources)) {
+    const cleaned = rawSources
+      .map((source) => {
+        if (!source || typeof source !== "object") {
+          return null;
+        }
+        const title = `${source.title || source.source_name || ""}`.trim();
+        const url = `${source.url || ""}`.trim();
+        const sourceName = `${source.source_name || ""}`.trim();
+        if (!title && !url && !sourceName) {
+          return null;
+        }
+        return {
+          title: title || sourceName || "Source",
+          url: url || undefined,
+          source_name: sourceName || undefined,
+        };
+      })
+      .filter((value) => Boolean(value));
+
+    if (cleaned.length > 0) {
+      return cleaned.slice(0, 4);
+    }
+  }
+
+  if (fallbackDocument) {
+    return [
+      {
+        title: fallbackDocument.title,
+        url: fallbackDocument.source_url || fallbackDocument.file_url || undefined,
+        source_name: fallbackDocument.source_name,
+      },
+    ];
+  }
+
+  return [];
+}
+
+function normalizeSummaryCard(rawCard, index, documents) {
+  const fallbackDocument = documents[index % Math.max(1, documents.length)] || documents[0];
+  const concept = `${rawCard?.concept || rawCard?.topic || fallbackDocument?.doc_type || "Concept"}`.trim();
+  const title = `${rawCard?.title || concept || "Understanding card"}`.trim();
+  const explanation = `${rawCard?.explanation || rawCard?.summary || ""}`.trim();
+  const whyItMatters = `${rawCard?.why_it_matters || rawCard?.whyItMatters || ""}`.trim();
+  const example = `${rawCard?.example || rawCard?.analogy || ""}`.trim();
+
+  if (!title || !explanation) {
+    return null;
+  }
+
+  return {
+    id: `${rawCard?.id || createSummaryCardId(`${concept}-${index}`)}`.trim(),
+    concept,
+    title,
+    explanation,
+    why_it_matters: whyItMatters || "This helps convert filing language into practical investor understanding.",
+    example: example || "Use this concept while reading the next filing update and compare wording vs numbers.",
+    level: normalizeCardLevel(rawCard?.level, 1),
+    source_refs: normalizeCardSources(rawCard?.source_refs, fallbackDocument),
+  };
+}
+
+function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
+  const baseDocument = documents[0];
+  if (!baseDocument) {
+    return [
+      {
+        id: createSummaryCardId(`${symbol}-fallback-1`),
+        concept: "Company overview",
+        title: `${companyName || symbol}: starting point`,
+        explanation: "No filing text was retrieved for this selection. Start with broader company context before deep analysis.",
+        why_it_matters: "Without source filings, confidence in conclusions stays limited.",
+        example: "Switch FY or filing scope and retry AI Summary.",
+        level: 1,
+        source_refs: [],
+      },
+    ];
+  }
+
+  const docTitle = baseDocument.title;
+  const sourceRef = normalizeCardSources([], baseDocument);
+
+  return [
+    {
+      id: createSummaryCardId(`${docTitle}-l1`),
+      concept: "What this filing says",
+      title: `Core idea from ${docTitle}`,
+      explanation: `${baseDocument.description || "This filing outlines management updates and reported business context."}`,
+      why_it_matters: "This is the baseline narrative before checking deeper evidence.",
+      example: "Ask: does management tone align with reported trend direction?",
+      level: 1,
+      source_refs: sourceRef,
+    },
+    {
+      id: createSummaryCardId(`${docTitle}-l2`),
+      concept: "Evidence linkage",
+      title: "Link commentary to disclosed numbers",
+      explanation: "Match management statements with explicit data points and period labels from the filing.",
+      why_it_matters: "Narrative-only analysis can miss inconsistencies.",
+      example: "Track whether guidance language improved while key metrics also improved.",
+      level: 2,
+      source_refs: sourceRef,
+    },
+    {
+      id: createSummaryCardId(`${docTitle}-l3`),
+      concept: "Risk consistency",
+      title: "Stress-test assumptions",
+      explanation: "List what could invalidate the current thesis and which next disclosures would confirm or reject it.",
+      why_it_matters: "Robust understanding requires explicit invalidation triggers.",
+      example: "If margin commentary is positive, verify if cost intensity also improved next quarter.",
+      level: 3,
+      source_refs: sourceRef,
+    },
+  ];
+}
+
+function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }) {
+  const fallbackDocument = documents[0];
+  const deeper = swipeDirection === "right";
+  const nextLevel = deeper
+    ? normalizeCardLevel((currentCard?.level ?? 1) + 1, 2)
+    : normalizeCardLevel((currentCard?.level ?? 2) - 1, 1);
+  const concept = `${currentCard?.concept || fallbackDocument?.doc_type || "Concept"}`.trim();
+  const title = deeper ? `${concept}: go deeper` : `${concept}: simpler view`;
+
+  return {
+    id: createSummaryCardId(`${concept}-${swipeDirection}-${nextLevel}`),
+    concept,
+    title,
+    explanation: deeper
+      ? "This deeper layer focuses on cause-effect links between commentary, numbers, and likely forward implications."
+      : "This simpler layer restates the concept in plain language with fewer assumptions and less jargon.",
+    why_it_matters: deeper
+      ? "Depth helps detect thesis strength, fragility, and consistency over time."
+      : "Clarity helps avoid confidence built on misunderstood terms.",
+    example: deeper
+      ? "Compare two sequential filings and identify one claim that strengthened and one that weakened."
+      : "Explain the concept to a non-finance friend in one sentence and check if the core meaning stays correct.",
+    level: nextLevel,
+    source_refs: normalizeCardSources([], fallbackDocument),
+  };
+}
+
 function parseGeminiOutput(data) {
   const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
 
@@ -463,6 +635,54 @@ function parseGeminiOutput(data) {
   return null;
 }
 
+function tryParseJson(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const direct = value.trim();
+  if (!direct) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(direct);
+  } catch {
+    // Continues with relaxed parsing attempts.
+  }
+
+  const fenced = direct.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch {
+      // Falls through.
+    }
+  }
+
+  const firstBrace = direct.indexOf("{");
+  const lastBrace = direct.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(direct.slice(firstBrace, lastBrace + 1));
+    } catch {
+      // Falls through.
+    }
+  }
+
+  const firstBracket = direct.indexOf("[");
+  const lastBracket = direct.lastIndexOf("]");
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    try {
+      return JSON.parse(direct.slice(firstBracket, lastBracket + 1));
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
 function buildGeminiHistory(history) {
   return history
     .slice(-6)
@@ -470,6 +690,32 @@ function buildGeminiHistory(history) {
       role: turn.role === "assistant" ? "model" : "user",
       parts: [{ text: turn.content }],
     }));
+}
+
+async function requestGemini(payload) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_MODEL
+  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    const trimmedError = errorText.trim();
+    throw new Error(
+      trimmedError
+        ? `LLM request failed (${response.status}): ${trimmedError.slice(0, 220)}`
+        : `LLM request failed with status ${response.status}.`
+    );
+  }
+
+  return response.json();
 }
 
 async function answerWithGemini({ question, companyName, symbol, documents, history, isSummaryRequest }) {
@@ -481,19 +727,7 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
     return null;
   }
 
-  const contextLines = documents.map((document, index) => {
-    const quarterLine = document.quarter ? `Quarter: ${document.quarter}` : "Quarter: n/a";
-    const yearLine = document.fiscal_year ? `Fiscal year: ${document.fiscal_year}` : "Fiscal year: n/a";
-    return [
-      `[${index + 1}] ${document.title}`,
-      `Type: ${document.doc_type}`,
-      quarterLine,
-      yearLine,
-      `Published: ${document.published_at}`,
-      `Source: ${document.source_name}`,
-      `Summary: ${document.description || "No summary available."}`,
-    ].join("\n");
-  });
+  const contextLines = buildContextLines(documents);
 
   const summaryInstruction = isSummaryRequest
     ? [
@@ -537,29 +771,7 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
     },
   };
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    GEMINI_MODEL
-  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    const trimmedError = errorText.trim();
-    throw new Error(
-      trimmedError
-        ? `LLM request failed (${response.status}): ${trimmedError.slice(0, 220)}`
-        : `LLM request failed with status ${response.status}.`
-    );
-  }
-
-  const data = await response.json();
+  const data = await requestGemini(payload);
   const parsed = parseGeminiOutput(data);
 
   if (!parsed) {
@@ -572,6 +784,108 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
   }
 
   return parsed;
+}
+
+async function generateSummaryCardsWithGemini({
+  mode,
+  companyName,
+  symbol,
+  documents,
+  swipeDirection,
+  currentCard,
+}) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("LLM is not configured. Set GEMINI_API_KEY on the backend.");
+  }
+
+  const contextLines = buildContextLines(documents).join("\n\n");
+
+  const systemPrompt = [
+    "You are Groww AI card composer for beginners.",
+    "Return strict JSON only. Do not include markdown or extra prose.",
+    "Use only provided filing context.",
+    "Each card must include: concept, title, explanation, why_it_matters, example, level, source_refs.",
+    "source_refs should be an array of objects with title and optional url/source_name.",
+  ].join("\n");
+
+  const userPrompt =
+    mode === "summary_cards_init"
+      ? [
+          `Company: ${companyName || symbol}`,
+          `Symbol: ${symbol}`,
+          "Task: Create 3 progressive summary cards (level 1 -> 3).",
+          "Tone: plain language, high clarity, no investment advice.",
+          "Output JSON shape: {\"cards\":[{...},{...},{...}]}",
+          "Context:",
+          contextLines,
+        ].join("\n\n")
+      : [
+          `Company: ${companyName || symbol}`,
+          `Symbol: ${symbol}`,
+          `Current card: ${JSON.stringify(currentCard)}`,
+          `Swipe direction: ${swipeDirection}`,
+          swipeDirection === "right"
+            ? "Task: Generate exactly 1 deeper follow-up card (higher level)."
+            : "Task: Generate exactly 1 simpler explanatory card (same/lower level, easier language).",
+          "Output JSON shape: {\"cards\":[{...}]}",
+          "Context:",
+          contextLines,
+        ].join("\n\n");
+
+  const payload = {
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: userPrompt }],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.35,
+      responseMimeType: "application/json",
+    },
+  };
+
+  const data = await requestGemini(payload);
+  const rawText = parseGeminiOutput(data);
+  const parsedJson = tryParseJson(rawText);
+
+  let rawCards = [];
+  if (Array.isArray(parsedJson)) {
+    rawCards = parsedJson;
+  } else if (parsedJson && typeof parsedJson === "object") {
+    if (Array.isArray(parsedJson.cards)) {
+      rawCards = parsedJson.cards;
+    } else if (parsedJson.card && typeof parsedJson.card === "object") {
+      rawCards = [parsedJson.card];
+    }
+  }
+
+  const normalizedCards = rawCards
+    .map((rawCard, index) => normalizeSummaryCard(rawCard, index, documents))
+    .filter((value) => Boolean(value));
+
+  if (normalizedCards.length > 0) {
+    return normalizedCards;
+  }
+
+  if (mode === "summary_cards_init") {
+    return buildFallbackSummaryCardsInit({
+      companyName,
+      symbol,
+      documents,
+    });
+  }
+
+  return [
+    buildFallbackNextSummaryCard({
+      swipeDirection,
+      currentCard,
+      documents,
+    }),
+  ];
 }
 
 app.get("/api/health", (_req, res) => {
@@ -645,10 +959,13 @@ app.get("/api/documents", async (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   try {
+    const mode = `${req.body.mode || "chat"}`.trim().toLowerCase();
     const symbol = `${req.body.symbol || ""}`.trim().toUpperCase();
     const companyName = `${req.body.company_name || ""}`.trim();
     const question = `${req.body.question || ""}`.trim();
     const year = `${req.body.year || ""}`.trim();
+    const swipeDirection = `${req.body.swipe_direction || ""}`.trim().toLowerCase();
+    const currentCard = req.body.current_card;
     const docIds = Array.isArray(req.body.doc_ids)
       ? req.body.doc_ids
           .map((docId) => `${docId || ""}`.trim())
@@ -667,12 +984,18 @@ app.post("/api/chat", async (req, res) => {
           .filter((turn) => turn.content.length > 0)
       : [];
 
+    const validModes = new Set(["chat", "summary_cards_init", "summary_cards_next"]);
+    if (!validModes.has(mode)) {
+      res.status(400).json({ error: "'mode' must be one of: chat, summary_cards_init, summary_cards_next." });
+      return;
+    }
+
     if (!symbol) {
       res.status(400).json({ error: "'symbol' is required." });
       return;
     }
 
-    if (!question) {
+    if (mode === "chat" && !question) {
       res.status(400).json({ error: "'question' is required." });
       return;
     }
@@ -690,13 +1013,71 @@ app.post("/api/chat", async (req, res) => {
       .map((item) => normalizeChatDocument(item));
 
     if (normalized.length === 0) {
+      if (mode === "chat") {
+        res.json({
+          answer: `I could not find filings for ${symbol}. Try another symbol or remove filters.`,
+          sources: [],
+          follow_up_questions: [
+            "Try a broader query without period filters.",
+            "Ask for a business model overview after selecting a symbol with filings.",
+          ],
+        });
+        return;
+      }
+
+      if (mode === "summary_cards_init") {
+        res.json({
+          cards: buildFallbackSummaryCardsInit({
+            companyName: companyName || symbol,
+            symbol,
+            documents: [],
+          }),
+          sources: [],
+          meta: {
+            model_used: GEMINI_MODEL,
+            retrieved_documents: 0,
+            doc_scope_requested: docIds.length > 0,
+          },
+        });
+        return;
+      }
+
+      if (swipeDirection !== "left" && swipeDirection !== "right") {
+        res.status(400).json({ error: "'swipe_direction' must be 'left' or 'right'." });
+        return;
+      }
+
+      const currentCardPayload =
+        currentCard && typeof currentCard === "object"
+          ? {
+              concept: `${currentCard.concept || ""}`.trim(),
+              title: `${currentCard.title || ""}`.trim(),
+              level: normalizeCardLevel(currentCard.level, 1),
+            }
+          : null;
+
+      if (!currentCardPayload || !currentCardPayload.title) {
+        res.status(400).json({
+          error: "'current_card' with at least a title is required for summary_cards_next.",
+        });
+        return;
+      }
+
       res.json({
-        answer: `I could not find filings for ${symbol}. Try another symbol or remove filters.`,
-        sources: [],
-        follow_up_questions: [
-          "Try a broader query without period filters.",
-          "Ask for a business model overview after selecting a symbol with filings.",
+        cards: [
+          buildFallbackNextSummaryCard({
+            swipeDirection,
+            currentCard: currentCardPayload,
+            documents: [],
+          }),
         ],
+        sources: [],
+        meta: {
+          model_used: GEMINI_MODEL,
+          retrieved_documents: 0,
+          doc_scope_requested: docIds.length > 0,
+          swipe_direction: swipeDirection,
+        },
       });
       return;
     }
@@ -720,6 +1101,88 @@ app.post("/api/chat", async (req, res) => {
     const contextDocuments = topDocuments.length > 0 ? topDocuments : retrievalPool.slice(0, 8);
 
     const finalCompanyName = companyName || contextDocuments[0]?.company_name || symbol;
+
+    if (mode === "summary_cards_init") {
+      try {
+        const cards = await generateSummaryCardsWithGemini({
+          mode,
+          companyName: finalCompanyName,
+          symbol,
+          documents: contextDocuments,
+        });
+
+        res.json({
+          cards,
+          sources: uniqueSources(contextDocuments, 8),
+          meta: {
+            model_used: GEMINI_MODEL,
+            retrieved_documents: contextDocuments.length,
+            doc_scope_requested: docIds.length > 0,
+          },
+        });
+      } catch (error) {
+        res.status(502).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : "LLM request failed while generating summary cards.",
+        });
+      }
+      return;
+    }
+
+    if (mode === "summary_cards_next") {
+      if (swipeDirection !== "left" && swipeDirection !== "right") {
+        res.status(400).json({ error: "'swipe_direction' must be 'left' or 'right'." });
+        return;
+      }
+
+      const currentCardPayload =
+        currentCard && typeof currentCard === "object"
+          ? {
+              concept: `${currentCard.concept || ""}`.trim(),
+              title: `${currentCard.title || ""}`.trim(),
+              level: normalizeCardLevel(currentCard.level, 1),
+            }
+          : null;
+
+      if (!currentCardPayload || !currentCardPayload.title) {
+        res.status(400).json({
+          error: "'current_card' with at least a title is required for summary_cards_next.",
+        });
+        return;
+      }
+
+      try {
+        const cards = await generateSummaryCardsWithGemini({
+          mode,
+          companyName: finalCompanyName,
+          symbol,
+          documents: contextDocuments,
+          swipeDirection,
+          currentCard: currentCardPayload,
+        });
+
+        res.json({
+          cards,
+          sources: uniqueSources(contextDocuments, 8),
+          meta: {
+            model_used: GEMINI_MODEL,
+            retrieved_documents: contextDocuments.length,
+            doc_scope_requested: docIds.length > 0,
+            swipe_direction: swipeDirection,
+          },
+        });
+      } catch (error) {
+        res.status(502).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : "LLM request failed while generating the next summary card.",
+        });
+      }
+      return;
+    }
 
     let answer;
     try {
