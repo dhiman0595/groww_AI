@@ -62,12 +62,16 @@ export async function fetchChatAnswer(payload: ChatRequest): Promise<ChatRespons
 
     if (response.status === 404 && !API_BASE_URL) {
       message =
-        "Chat API not found on this domain. Set VITE_API_BASE_URL to your deployed backend URL (for example Render/Railway) or deploy /api as Netlify Functions.";
+        "Chat API not found on this domain. Ensure /api/chat is deployed and reachable from the same app URL.";
     }
 
     if (response.status >= 500 && !API_BASE_URL) {
       message =
-        "Backend is unavailable. Deploy the API server and set VITE_API_BASE_URL in Netlify environment variables.";
+        `Backend is unavailable (status ${response.status}). Check server logs and environment variables (GEMINI_API_KEY, DATABASE_URL).`;
+    }
+
+    if (message === "Failed to fetch chat answer from API.") {
+      message = `Chat request failed with status ${response.status}.`;
     }
 
     throw new Error(message);

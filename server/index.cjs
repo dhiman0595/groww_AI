@@ -18,8 +18,8 @@ const {
 } = require("./utils/documentHelpers.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
-const OPENAI_API_KEY = `${process.env.OPENAI_API_KEY || ""}`.trim();
-const OPENAI_MODEL = `${process.env.OPENAI_MODEL || "gpt-4.1-mini"}`.trim();
+const GEMINI_API_KEY = `${process.env.GEMINI_API_KEY || ""}`.trim();
+const GEMINI_MODEL = `${process.env.GEMINI_MODEL || "gemini-2.5-flash"}`.trim();
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
 const DIST_INDEX_FILE = path.join(DIST_DIR, "index.html");
 const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
@@ -440,23 +440,41 @@ function buildFollowUpQuestions({ companyName, year, quarter, topDocuments }) {
   return Array.from(new Set(suggested)).slice(0, 6);
 }
 
-function parseOpenAiOutput(data) {
-  if (typeof data.output_text === "string" && data.output_text.trim().length > 0) {
-    return data.output_text.trim();
+function parseGeminiOutput(data) {
+  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+
+  for (const candidate of candidates) {
+    const parts = candidate?.content?.parts;
+    if (!Array.isArray(parts)) {
+      continue;
+    }
+
+    const text = parts
+      .map((part) => (typeof part?.text === "string" ? part.text.trim() : ""))
+      .filter((value) => value.length > 0)
+      .join("\n")
+      .trim();
+
+    if (text.length > 0) {
+      return text;
+    }
   }
 
-  const flattened = (data.output || [])
-    .flatMap((item) => item.content || [])
-    .filter((item) => item.type === "output_text" && typeof item.text === "string")
-    .map((item) => item.text.trim())
-    .filter((text) => text.length > 0);
-
-  return flattened.length > 0 ? flattened.join("\n").trim() : null;
+  return null;
 }
 
-async function answerWithOpenAi({ question, companyName, symbol, documents, history, isSummaryRequest }) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("LLM is not configured. Set OPENAI_API_KEY on the backend.");
+function buildGeminiHistory(history) {
+  return history
+    .slice(-6)
+    .map((turn) => ({
+      role: turn.role === "assistant" ? "model" : "user",
+      parts: [{ text: turn.content }],
+    }));
+}
+
+async function answerWithGemini({ question, companyName, symbol, documents, history, isSummaryRequest }) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("LLM is not configured. Set GEMINI_API_KEY on the backend.");
   }
 
   if (documents.length === 0) {
@@ -493,54 +511,40 @@ async function answerWithOpenAi({ question, companyName, symbol, documents, hist
       ].join("\n")
     : "Answer in concise, beginner-friendly language and cite context snippets like [1], [2].";
 
-  const recentHistory = history
-    .slice(-6)
-    .map((turn) => `${turn.role.toUpperCase()}: ${turn.content}`)
-    .join("\n");
+  const systemPrompt = [
+    "You are Groww AI for beginner investors.",
+    "Use only the provided filing context.",
+    "If data is missing, clearly say it is not available in retrieved documents.",
+    "Do not provide buy/sell recommendations.",
+    summaryInstruction,
+  ].join("\n");
+
+  const questionPrompt = [
+    `Company: ${companyName || symbol}`,
+    `Symbol: ${symbol}`,
+    `Question: ${question}`,
+    "Retrieved filing snippets:",
+    contextLines.join("\n\n"),
+  ].join("\n\n");
 
   const payload = {
-    model: OPENAI_MODEL || "gpt-4.1-mini",
-    input: [
-      {
-        role: "system",
-        content: [
-          {
-            type: "input_text",
-            text: [
-              "You are Groww AI for beginner investors.",
-              "Use only the provided filing context.",
-              "If data is missing, clearly say it is not available in retrieved documents.",
-              "Do not provide buy/sell recommendations.",
-              summaryInstruction,
-            ].join("\n"),
-          },
-        ],
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: [
-              `Company: ${companyName || symbol}`,
-              `Symbol: ${symbol}`,
-              `Conversation context:\n${recentHistory || "No prior turns."}`,
-              `Question: ${question}`,
-              "Retrieved filing snippets:",
-              contextLines.join("\n\n"),
-            ].join("\n\n"),
-          },
-        ],
-      },
-    ],
-    temperature: 0.2,
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [...buildGeminiHistory(history), { role: "user", parts: [{ text: questionPrompt }] }],
+    generationConfig: {
+      temperature: 0.2,
+    },
   };
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    GEMINI_MODEL
+  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify(payload),
   });
@@ -556,8 +560,14 @@ async function answerWithOpenAi({ question, companyName, symbol, documents, hist
   }
 
   const data = await response.json();
-  const parsed = parseOpenAiOutput(data);
+  const parsed = parseGeminiOutput(data);
+
   if (!parsed) {
+    const blockReason = data?.promptFeedback?.blockReason;
+    if (typeof blockReason === "string" && blockReason.length > 0) {
+      throw new Error(`LLM response blocked: ${blockReason}.`);
+    }
+
     throw new Error("LLM returned an empty answer.");
   }
 
@@ -667,9 +677,9 @@ app.post("/api/chat", async (req, res) => {
       return;
     }
 
-    if (!OPENAI_API_KEY) {
+    if (!GEMINI_API_KEY) {
       res.status(500).json({
-        error: "LLM is not configured. Add OPENAI_API_KEY in backend environment variables.",
+        error: "LLM is not configured. Add GEMINI_API_KEY in backend environment variables.",
       });
       return;
     }
@@ -713,7 +723,7 @@ app.post("/api/chat", async (req, res) => {
 
     let answer;
     try {
-      answer = await answerWithOpenAi({
+      answer = await answerWithGemini({
         question,
         companyName: finalCompanyName,
         symbol,
@@ -761,7 +771,7 @@ app.post("/api/chat", async (req, res) => {
       sources,
       follow_up_questions: followUpQuestions,
       meta: {
-        model_used: OPENAI_API_KEY ? OPENAI_MODEL : "fallback-rag",
+        model_used: GEMINI_MODEL,
         retrieved_documents: contextDocuments.length,
         doc_scope_requested: docIds.length > 0,
       },
