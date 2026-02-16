@@ -71,3 +71,16 @@ export default defineConfig([
   },
 ])
 ```
+
+## Companies Master Import (Neon/Postgres)
+
+The company dropdown can be powered from a `companies_master` table in Postgres.
+
+1. Set `DATABASE_URL` in your environment.
+2. Run:
+
+```bash
+npm run import:companies -- /absolute/path/to/ISIN_mapping.json --replace
+```
+
+This creates/updates `companies_master` and `/api/companies` will use this table as the primary source.

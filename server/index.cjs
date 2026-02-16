@@ -16,6 +16,7 @@ const {
   sortRawDocuments,
   withinDateRange,
 } = require("./utils/documentHelpers.cjs");
+const { fetchCompaniesFromMaster } = require("./db/companiesMaster.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
 const GEMINI_API_KEY = `${process.env.GEMINI_API_KEY || ""}`.trim();
@@ -895,6 +896,13 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/companies", async (req, res) => {
   try {
     const query = `${req.query.query || ""}`.trim().toLowerCase();
+    const masterCompanies = await fetchCompaniesFromMaster({ query, limit: 120 });
+
+    if (Array.isArray(masterCompanies)) {
+      res.json({ companies: masterCompanies });
+      return;
+    }
+
     const rawItems = await loadRawDocuments();
 
     const companies = buildCompanies(rawItems).filter((company) => {
