@@ -13,10 +13,28 @@ function hasRagDatabase() {
   return hasMasterDatabase();
 }
 
-function toVectorLiteral(values) {
+function alignEmbeddingDimension(values) {
   const safeValues = Array.isArray(values)
     ? values.map((value) => (Number.isFinite(Number(value)) ? Number(value) : 0))
     : [];
+
+  if (safeValues.length === RAG_EMBEDDING_DIM) {
+    return safeValues;
+  }
+
+  if (safeValues.length > RAG_EMBEDDING_DIM) {
+    return safeValues.slice(0, RAG_EMBEDDING_DIM);
+  }
+
+  const padded = safeValues.slice();
+  while (padded.length < RAG_EMBEDDING_DIM) {
+    padded.push(0);
+  }
+  return padded;
+}
+
+function toVectorLiteral(values) {
+  const safeValues = alignEmbeddingDimension(values);
   return `[${safeValues.join(",")}]`;
 }
 
@@ -147,7 +165,7 @@ async function upsertRagChunks(rows) {
       chunk_index: Math.max(0, Number(row.chunk_index) || 0),
       chunk_text: `${row.chunk_text || ""}`.trim(),
       chunk_tokens: Math.max(0, Number(row.chunk_tokens) || 0),
-      embedding_literal: toVectorLiteral(row.embedding),
+      embedding_literal: toVectorLiteral(alignEmbeddingDimension(row.embedding)),
     }))
     .filter((row) => row.chunk_id && row.doc_id && row.symbol && row.title && row.chunk_text && row.embedding_literal.length > 2);
 
@@ -317,10 +335,120 @@ async function searchRagChunks(options = {}) {
   }));
 }
 
+function tokenizeQuery(text) {
+  return `${text || ""}`
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+}
+
+async function searchRagChunksByKeywords(options = {}) {
+  const symbol = `${options.symbol || ""}`.trim().toUpperCase();
+  const query = `${options.query || ""}`.trim();
+  const docIds = Array.isArray(options.docIds)
+    ? Array.from(new Set(options.docIds.map((value) => `${value || ""}`.trim()).filter((value) => value.length > 0)))
+    : [];
+  const year = `${options.year || ""}`.trim().toUpperCase();
+  const limit = Math.max(1, Math.min(Number(options.limit) || 8, 24));
+  const probeLimit = Math.max(limit * 15, 120);
+
+  if (!symbol || !query) {
+    return [];
+  }
+
+  const isReady = await ensureRagSchema();
+  if (!isReady) {
+    return [];
+  }
+
+  const pool = createPool();
+  const hasDocIds = docIds.length > 0;
+
+  const { rows } = await pool.query(
+    `
+      SELECT
+        chunk_id,
+        doc_id,
+        symbol,
+        company_name,
+        doc_type,
+        title,
+        quarter,
+        fiscal_year,
+        published_at,
+        source_name,
+        source_url,
+        file_url,
+        chunk_index,
+        chunk_text,
+        chunk_tokens
+      FROM filing_rag_chunks
+      WHERE symbol = $1
+        AND ($2::boolean = false OR doc_id = ANY($3::text[]))
+        AND (
+          $4::text = ''
+          OR (fiscal_year IS NOT NULL AND upper(fiscal_year) LIKE '%' || $4 || '%')
+          OR (published_at IS NOT NULL AND EXTRACT(YEAR FROM published_at)::text = $4)
+        )
+      ORDER BY published_at DESC NULLS LAST
+      LIMIT $5;
+    `,
+    [symbol, hasDocIds, docIds, year, probeLimit]
+  );
+
+  const tokens = tokenizeQuery(query);
+  const scored = rows
+    .map((row) => {
+      const haystack = `${row.title || ""} ${row.chunk_text || ""}`.toLowerCase();
+      let keywordScore = 0;
+      for (const token of tokens) {
+        if (haystack.includes(token)) {
+          keywordScore += 1;
+        }
+      }
+      const density = tokens.length > 0 ? keywordScore / tokens.length : 0;
+
+      return {
+        row,
+        score: density,
+      };
+    })
+    .filter((item) => item.score > 0 || tokens.length === 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, limit);
+
+  return scored.map((item) => {
+    const row = item.row;
+    return {
+      chunk_id: `${row.chunk_id || ""}`.trim(),
+      doc_id: `${row.doc_id || ""}`.trim(),
+      symbol: `${row.symbol || ""}`.trim(),
+      company_name: `${row.company_name || ""}`.trim(),
+      doc_type: `${row.doc_type || ""}`.trim(),
+      title: `${row.title || ""}`.trim(),
+      quarter: `${row.quarter || ""}`.trim(),
+      fiscal_year: `${row.fiscal_year || ""}`.trim(),
+      published_at: row.published_at ? new Date(row.published_at).toISOString() : "",
+      source_name: `${row.source_name || ""}`.trim(),
+      source_url: `${row.source_url || ""}`.trim(),
+      file_url: `${row.file_url || ""}`.trim(),
+      chunk_index: Number(row.chunk_index) || 0,
+      chunk_text: `${row.chunk_text || ""}`.trim(),
+      chunk_tokens: Number(row.chunk_tokens) || 0,
+      similarity: Number(item.score) || 0,
+    };
+  });
+}
+
 module.exports = {
+  RAG_EMBEDDING_DIM,
   hasRagDatabase,
+  alignEmbeddingDimension,
   ensureRagSchema,
   findIndexedDocIds,
   upsertRagChunks,
   searchRagChunks,
+  searchRagChunksByKeywords,
 };

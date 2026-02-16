@@ -23,17 +23,19 @@ const {
 } = require("./utils/documentHelpers.cjs");
 const { fetchCompaniesFromMaster, hasMasterDatabase } = require("./db/companiesMaster.cjs");
 const {
+  alignEmbeddingDimension,
   ensureRagSchema,
   findIndexedDocIds,
   hasRagDatabase,
   searchRagChunks,
+  searchRagChunksByKeywords,
   upsertRagChunks,
 } = require("./db/ragStore.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
-const GEMINI_API_KEY = `${process.env.GEMINI_API_KEY || ""}`.trim();
-const GEMINI_MODEL = `${process.env.GEMINI_MODEL || "gemini-2.5-flash"}`.trim();
-const GEMINI_EMBEDDING_MODEL = `${process.env.GEMINI_EMBEDDING_MODEL || "text-embedding-004"}`.trim();
+const XAI_API_KEY = `${process.env.XAI_API_KEY || ""}`.trim();
+const XAI_MODEL = `${process.env.XAI_MODEL || "grok-3-mini"}`.trim();
+const XAI_EMBEDDING_MODEL = `${process.env.XAI_EMBEDDING_MODEL || ""}`.trim();
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
 const DIST_INDEX_FILE = path.join(DIST_DIR, "index.html");
 const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
@@ -56,7 +58,7 @@ const ragIngestionInFlight = new Set();
 app.use(cors());
 app.use(express.json());
 
-if (hasRagDatabase() && GEMINI_API_KEY) {
+if (hasRagDatabase() && XAI_API_KEY) {
   void ensureRagSchema();
 }
 
@@ -540,8 +542,8 @@ function createRagChunkId(document, chunkIndex, chunkText) {
   )}`;
 }
 
-async function requestGeminiEmbedding(text, taskType) {
-  if (!GEMINI_API_KEY) {
+async function requestXaiEmbedding(text, _taskType) {
+  if (!XAI_API_KEY || !XAI_EMBEDDING_MODEL) {
     return [];
   }
 
@@ -550,20 +552,17 @@ async function requestGeminiEmbedding(text, taskType) {
     return [];
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    GEMINI_EMBEDDING_MODEL
-  )}:embedContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  const endpoint = "https://api.x.ai/v1/embeddings";
 
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${XAI_API_KEY}`,
     },
     body: JSON.stringify({
-      content: {
-        parts: [{ text: prompt.slice(0, RAG_EMBEDDING_INPUT_CHARS) }],
-      },
-      taskType: taskType || "RETRIEVAL_DOCUMENT",
+      model: XAI_EMBEDDING_MODEL,
+      input: prompt.slice(0, RAG_EMBEDDING_INPUT_CHARS),
     }),
   });
 
@@ -573,15 +572,13 @@ async function requestGeminiEmbedding(text, taskType) {
   }
 
   const data = await response.json();
-  const valuesFromSingle = Array.isArray(data?.embedding?.values) ? data.embedding.values : [];
-  const valuesFromBatch = Array.isArray(data?.embeddings?.[0]?.values) ? data.embeddings[0].values : [];
-  const values = valuesFromSingle.length > 0 ? valuesFromSingle : valuesFromBatch;
+  const values = Array.isArray(data?.data?.[0]?.embedding) ? data.data[0].embedding : [];
 
   if (!Array.isArray(values) || values.length === 0) {
     return [];
   }
 
-  return values.map((value) => (Number.isFinite(Number(value)) ? Number(value) : 0));
+  return alignEmbeddingDimension(values);
 }
 
 async function ingestDocumentIntoRag(document) {
@@ -611,16 +608,16 @@ async function ingestDocumentIntoRag(document) {
 
   for (let index = 0; index < chunks.length; index += 1) {
     const chunkText = chunks[index];
-    let embedding;
-    try {
-      embedding = await requestGeminiEmbedding(chunkText, "RETRIEVAL_DOCUMENT");
-    } catch (error) {
-      console.error("Chunk embedding failed:", error.message);
-      continue;
+    let embedding = [];
+    if (XAI_EMBEDDING_MODEL && XAI_API_KEY) {
+      try {
+        embedding = await requestXaiEmbedding(chunkText, "RETRIEVAL_DOCUMENT");
+      } catch (error) {
+        console.error("Chunk embedding failed:", error.message);
+      }
     }
-
     if (!Array.isArray(embedding) || embedding.length === 0) {
-      continue;
+      embedding = alignEmbeddingDimension([]);
     }
 
     rows.push({
@@ -668,7 +665,7 @@ function queueRagIngestion(document) {
 }
 
 async function ensureRagCoverage(documents, options = {}) {
-  if (!hasRagDatabase() || !GEMINI_API_KEY) {
+  if (!hasRagDatabase() || !XAI_API_KEY) {
     return;
   }
 
@@ -714,7 +711,7 @@ async function retrieveRagChunksForQuestion(options = {}) {
     : [];
   const limit = Math.max(2, Math.min(Number(options.limit) || RAG_RETRIEVAL_LIMIT, 20));
 
-  if (!symbol || !question || !hasRagDatabase() || !GEMINI_API_KEY) {
+  if (!symbol || !question || !hasRagDatabase() || !XAI_API_KEY) {
     return [];
   }
 
@@ -723,28 +720,39 @@ async function retrieveRagChunksForQuestion(options = {}) {
     return [];
   }
 
-  let queryEmbedding;
-  try {
-    queryEmbedding = await requestGeminiEmbedding(question, "RETRIEVAL_QUERY");
-  } catch (error) {
-    console.error("Query embedding failed:", error.message);
-    return [];
+  if (XAI_EMBEDDING_MODEL) {
+    let queryEmbedding;
+    try {
+      queryEmbedding = await requestXaiEmbedding(question, "RETRIEVAL_QUERY");
+    } catch (error) {
+      console.error("Query embedding failed:", error.message);
+    }
+
+    if (Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
+      try {
+        return await searchRagChunks({
+          symbol,
+          embedding: queryEmbedding,
+          docIds,
+          year,
+          limit,
+        });
+      } catch (error) {
+        console.error("RAG vector retrieval failed:", error.message);
+      }
+    }
   }
 
-  if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
-    return [];
-  }
-
   try {
-    return await searchRagChunks({
+    return await searchRagChunksByKeywords({
       symbol,
-      embedding: queryEmbedding,
+      query: question,
       docIds,
       year,
       limit,
     });
   } catch (error) {
-    console.error("RAG retrieval failed:", error.message);
+    console.error("RAG lexical retrieval failed:", error.message);
     return [];
   }
 }
@@ -1132,21 +1140,49 @@ function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }
   };
 }
 
-function parseGeminiOutput(data) {
-  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+function parseLlmOutput(data) {
+  const choices = Array.isArray(data?.choices) ? data.choices : [];
+  for (const choice of choices) {
+    const message = choice?.message;
+    if (!message) {
+      continue;
+    }
 
+    if (typeof message.content === "string" && message.content.trim().length > 0) {
+      return message.content.trim();
+    }
+
+    if (Array.isArray(message.content)) {
+      const text = message.content
+        .map((part) => {
+          if (typeof part === "string") {
+            return part.trim();
+          }
+          if (typeof part?.text === "string") {
+            return part.text.trim();
+          }
+          return "";
+        })
+        .filter((value) => value.length > 0)
+        .join("\n")
+        .trim();
+      if (text.length > 0) {
+        return text;
+      }
+    }
+  }
+
+  const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
   for (const candidate of candidates) {
     const parts = candidate?.content?.parts;
     if (!Array.isArray(parts)) {
       continue;
     }
-
     const text = parts
       .map((part) => (typeof part?.text === "string" ? part.text.trim() : ""))
       .filter((value) => value.length > 0)
       .join("\n")
       .trim();
-
     if (text.length > 0) {
       return text;
     }
@@ -1203,24 +1239,22 @@ function tryParseJson(value) {
   return null;
 }
 
-function buildGeminiHistory(history) {
+function buildXaiHistory(history) {
   return history
     .slice(-6)
     .map((turn) => ({
-      role: turn.role === "assistant" ? "model" : "user",
-      parts: [{ text: turn.content }],
+      role: turn.role === "assistant" ? "assistant" : "user",
+      content: turn.content,
     }));
 }
 
-async function requestGemini(payload) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    GEMINI_MODEL
-  )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
+async function requestXaiChatCompletion(payload) {
+  const endpoint = "https://api.x.ai/v1/chat/completions";
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${XAI_API_KEY}`,
     },
     body: JSON.stringify(payload),
   });
@@ -1238,9 +1272,9 @@ async function requestGemini(payload) {
   return response.json();
 }
 
-async function answerWithGemini({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("LLM is not configured. Set GEMINI_API_KEY on the backend.");
+async function answerWithGrok({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
+  if (!XAI_API_KEY) {
+    throw new Error("LLM is not configured. Set XAI_API_KEY on the backend.");
   }
 
   if (documents.length === 0) {
@@ -1291,31 +1325,26 @@ async function answerWithGemini({ question, companyName, symbol, documents, hist
   ].join("\n\n");
 
   const payload = {
-    systemInstruction: {
-      parts: [{ text: systemPrompt }],
-    },
-    contents: [...buildGeminiHistory(history), { role: "user", parts: [{ text: questionPrompt }] }],
-    generationConfig: {
-      temperature: 0.2,
-    },
+    model: XAI_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...buildXaiHistory(history),
+      { role: "user", content: questionPrompt },
+    ],
+    temperature: 0.2,
   };
 
-  const data = await requestGemini(payload);
-  const parsed = parseGeminiOutput(data);
+  const data = await requestXaiChatCompletion(payload);
+  const parsed = parseLlmOutput(data);
 
   if (!parsed) {
-    const blockReason = data?.promptFeedback?.blockReason;
-    if (typeof blockReason === "string" && blockReason.length > 0) {
-      throw new Error(`LLM response blocked: ${blockReason}.`);
-    }
-
     throw new Error("LLM returned an empty answer.");
   }
 
   return parsed;
 }
 
-async function generateSummaryCardsWithGemini({
+async function generateSummaryCardsWithGrok({
   mode,
   companyName,
   symbol,
@@ -1324,8 +1353,8 @@ async function generateSummaryCardsWithGemini({
   swipeDirection,
   currentCard,
 }) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("LLM is not configured. Set GEMINI_API_KEY on the backend.");
+  if (!XAI_API_KEY) {
+    throw new Error("LLM is not configured. Set XAI_API_KEY on the backend.");
   }
 
   const docContextLines = buildContextLines(documents).join("\n\n");
@@ -1369,23 +1398,19 @@ async function generateSummaryCardsWithGemini({
         ].join("\n\n");
 
   const payload = {
-    systemInstruction: {
-      parts: [{ text: systemPrompt }],
-    },
-    contents: [
+    model: XAI_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
       {
         role: "user",
-        parts: [{ text: userPrompt }],
+        content: userPrompt,
       },
     ],
-    generationConfig: {
-      temperature: 0.35,
-      responseMimeType: "application/json",
-    },
+    temperature: 0.35,
   };
 
-  const data = await requestGemini(payload);
-  const rawText = parseGeminiOutput(data);
+  const data = await requestXaiChatCompletion(payload);
+  const rawText = parseLlmOutput(data);
   const parsedJson = tryParseJson(rawText);
 
   let rawCards = [];
@@ -1494,7 +1519,7 @@ app.get("/api/documents", async (req, res) => {
     const start = (page - 1) * pageSize;
     const end = start + pageSize;
 
-    if (hasRagDatabase() && GEMINI_API_KEY) {
+    if (hasRagDatabase() && XAI_API_KEY) {
       const preloadDocuments = sorted.slice(0, RAG_INGEST_PRELOAD_LIMIT).map((item) => normalizeChatDocument(item));
       void ensureRagCoverage(preloadDocuments, { blockingCount: 0 });
     }
@@ -1526,8 +1551,8 @@ app.post("/api/rag/ingest", async (req, res) => {
       return;
     }
 
-    if (!GEMINI_API_KEY) {
-      res.status(400).json({ error: "GEMINI_API_KEY is required for RAG ingestion." });
+    if (!XAI_API_KEY) {
+      res.status(400).json({ error: "XAI_API_KEY is required for RAG ingestion." });
       return;
     }
 
@@ -1610,9 +1635,9 @@ app.post("/api/chat", async (req, res) => {
       return;
     }
 
-    if (!GEMINI_API_KEY) {
+    if (!XAI_API_KEY) {
       res.status(500).json({
-        error: "LLM is not configured. Add GEMINI_API_KEY in backend environment variables.",
+        error: "LLM is not configured. Add XAI_API_KEY in backend environment variables.",
       });
       return;
     }
@@ -1644,7 +1669,7 @@ app.post("/api/chat", async (req, res) => {
           }),
           sources: [],
           meta: {
-            model_used: GEMINI_MODEL,
+            model_used: XAI_MODEL,
             retrieved_documents: 0,
             doc_scope_requested: docIds.length > 0,
           },
@@ -1683,7 +1708,7 @@ app.post("/api/chat", async (req, res) => {
         ],
         sources: [],
         meta: {
-          model_used: GEMINI_MODEL,
+          model_used: XAI_MODEL,
           retrieved_documents: 0,
           doc_scope_requested: docIds.length > 0,
           swipe_direction: swipeDirection,
@@ -1741,7 +1766,7 @@ app.post("/api/chat", async (req, res) => {
 
     if (mode === "summary_cards_init") {
       try {
-        const cards = await generateSummaryCardsWithGemini({
+        const cards = await generateSummaryCardsWithGrok({
           mode,
           companyName: finalCompanyName,
           symbol,
@@ -1753,7 +1778,7 @@ app.post("/api/chat", async (req, res) => {
           cards,
           sources: blendedSources,
           meta: {
-            model_used: GEMINI_MODEL,
+            model_used: XAI_MODEL,
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             retrieved_chunks: ragChunks.length,
@@ -1795,7 +1820,7 @@ app.post("/api/chat", async (req, res) => {
       }
 
       try {
-        const cards = await generateSummaryCardsWithGemini({
+        const cards = await generateSummaryCardsWithGrok({
           mode,
           companyName: finalCompanyName,
           symbol,
@@ -1809,7 +1834,7 @@ app.post("/api/chat", async (req, res) => {
           cards,
           sources: blendedSources,
           meta: {
-            model_used: GEMINI_MODEL,
+            model_used: XAI_MODEL,
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             retrieved_chunks: ragChunks.length,
@@ -1831,7 +1856,7 @@ app.post("/api/chat", async (req, res) => {
 
     let answer;
     try {
-      answer = await answerWithGemini({
+      answer = await answerWithGrok({
         question,
         companyName: finalCompanyName,
         symbol,
@@ -1880,7 +1905,7 @@ app.post("/api/chat", async (req, res) => {
       sources,
       follow_up_questions: followUpQuestions,
       meta: {
-        model_used: GEMINI_MODEL,
+        model_used: XAI_MODEL,
         retrieved_documents: enrichedContextDocuments.length,
         enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
         retrieved_chunks: ragChunks.length,
