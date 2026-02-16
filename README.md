@@ -104,3 +104,7 @@ If you still see only a small hardcoded set of companies, check:
 1. `VITE_DOCS_MODE=real` in frontend env.
 2. `DATABASE_URL` is set on backend.
 3. `companies_master` has been imported (`npm run import:companies -- <path-to-ISIN_mapping.json> --replace`).
+
+### Company list size
+
+`/api/companies` now returns a large master list when search is empty (default limit 6000), so the dropdown can scroll through the full imported mapping list.

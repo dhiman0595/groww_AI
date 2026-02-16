@@ -65,7 +65,9 @@ export async function fetchCompanies(query?: string): Promise<CompanyOption[]> {
     return filterCompaniesByQuery(deriveCompaniesFromDocuments(documents), query);
   }
 
-  const endpoint = withBaseUrl(`/api/companies${toQueryString({ query })}`);
+  const normalizedQuery = query?.trim();
+  const limit = normalizedQuery ? 200 : 6000;
+  const endpoint = withBaseUrl(`/api/companies${toQueryString({ query: normalizedQuery, limit })}`);
   const response = await fetch(endpoint);
 
   if (!response.ok) {

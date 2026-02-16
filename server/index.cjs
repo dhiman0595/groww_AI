@@ -930,6 +930,9 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/companies", async (req, res) => {
   try {
     const query = `${req.query.query || ""}`.trim().toLowerCase();
+    const requestedLimit = Number(req.query.limit);
+    const defaultLimit = query.length > 0 ? 200 : 6000;
+    const limit = Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit;
     if (!hasMasterDatabase()) {
       res.status(500).json({
         error:
@@ -938,7 +941,7 @@ app.get("/api/companies", async (req, res) => {
       return;
     }
 
-    const masterCompanies = await fetchCompaniesFromMaster({ query, limit: 120 });
+    const masterCompanies = await fetchCompaniesFromMaster({ query, limit });
 
     if (Array.isArray(masterCompanies)) {
       res.json({ companies: masterCompanies });

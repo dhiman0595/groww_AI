@@ -128,7 +128,12 @@ async function fetchCompaniesFromMaster(options = {}) {
     await ensureCompaniesMasterSchema();
 
     const term = normalizeSearchableText(options.query);
-    const limit = Math.max(1, Math.min(Number(options.limit) || 80, 300));
+    const requestedLimit = Number(options.limit);
+    const defaultLimit = term.length > 0 ? 200 : 6000;
+    const limit = Math.max(
+      1,
+      Math.min(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 10000)
+    );
 
     const { rows } = await activePool.query(
       `
