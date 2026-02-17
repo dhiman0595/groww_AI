@@ -60,6 +60,13 @@ const REQUIRED_SUMMARY_SECTION_HEADERS = [
   "Risks, red flags, and consistency checks",
   "Which points/sections should absolutely be included",
 ];
+const NOT_CLEARLY_DISCLOSED_TEXT = "Not clearly disclosed in the provided document.";
+const SUMMARY_JSON_WORD_LIMIT = 55;
+const SUMMARY_JSON_MAX_DOCUMENT_TEXT = 36_000;
+const SUMMARY_JSON_MIN_SECTIONS = 3;
+const SUMMARY_JSON_MAX_SECTIONS = 8;
+const SUMMARY_JSON_MIN_METRICS = 5;
+const SUMMARY_JSON_MAX_METRICS = 10;
 const PDF_TEXT_FETCH_TIMEOUT_MS = 12000;
 const PDF_TEXT_MAX_BYTES = 12 * 1024 * 1024;
 const PDF_TEXT_MAX_CHARS = 45000;
@@ -1909,6 +1916,332 @@ function tryParseJson(value) {
   return null;
 }
 
+function safeSummaryString(value, maxChars = 420) {
+  return normalizeWhitespace(
+    `${value || ""}`
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/\*\*|__/g, "")
+      .replace(/^[ \t]*[-+*#]\s+/gm, "")
+      .replace(/[ \t]*`[ \t]*/g, "")
+  ).slice(0, Math.max(1, maxChars));
+}
+
+function trimToWordLimit(value, maxWords = SUMMARY_JSON_WORD_LIMIT) {
+  const normalized = safeSummaryString(value, 600);
+  const words = normalized.split(/\s+/).filter((word) => word.length > 0);
+  if (words.length <= maxWords) {
+    return normalized;
+  }
+  return words.slice(0, maxWords).join(" ");
+}
+
+function hasForbiddenMarkdown(text) {
+  const value = `${text || ""}`;
+  return /(^|\n)[ \t]*[-+*]\s+/m.test(value) || /(^|\n)[ \t]*#{1,6}\s+/m.test(value) || /\*\*|__/.test(value);
+}
+
+function toSummaryItems(items, fallbackItems) {
+  const source = Array.isArray(items) ? items : [];
+  const normalized = source
+    .map((item) => trimToWordLimit(item, SUMMARY_JSON_WORD_LIMIT))
+    .filter((item) => item.length > 0)
+    .slice(0, 8);
+
+  if (normalized.length >= 2) {
+    return normalized;
+  }
+
+  const fallback = (Array.isArray(fallbackItems) ? fallbackItems : [NOT_CLEARLY_DISCLOSED_TEXT, NOT_CLEARLY_DISCLOSED_TEXT])
+    .map((item) => trimToWordLimit(item, SUMMARY_JSON_WORD_LIMIT))
+    .filter((item) => item.length > 0);
+
+  return fallback.length >= 2 ? fallback.slice(0, 8) : [NOT_CLEARLY_DISCLOSED_TEXT, NOT_CLEARLY_DISCLOSED_TEXT];
+}
+
+function normalizeSummarySection(section, fallbackHeading) {
+  const heading = safeSummaryString(section?.heading || fallbackHeading || "Section", 110);
+  if (!heading) {
+    return null;
+  }
+
+  return {
+    heading,
+    items: toSummaryItems(section?.items, [NOT_CLEARLY_DISCLOSED_TEXT, NOT_CLEARLY_DISCLOSED_TEXT]),
+  };
+}
+
+function normalizeSummaryMetric(metric) {
+  const metricLabel = safeSummaryString(metric?.metric || "", 90);
+  const metricValue = safeSummaryString(metric?.value || "", 120);
+  const meaning = trimToWordLimit(metric?.what_it_means || "", SUMMARY_JSON_WORD_LIMIT);
+
+  if (!metricLabel || !metricValue || !meaning) {
+    return null;
+  }
+
+  return {
+    metric: metricLabel,
+    value: metricValue,
+    what_it_means: meaning,
+  };
+}
+
+function inferPeriodLabel({ year, quarter, documents }) {
+  const parts = [];
+  if (quarter) {
+    parts.push(quarter);
+  }
+  if (year) {
+    parts.push(year);
+  }
+
+  if (parts.length > 0) {
+    return parts.join(" ");
+  }
+
+  const firstDocument = Array.isArray(documents) && documents.length > 0 ? documents[0] : null;
+  const inferredParts = [firstDocument?.quarter || "", firstDocument?.fiscal_year || ""].filter((part) => `${part}`.trim().length > 0);
+  return inferredParts.length > 0 ? inferredParts.join(" ") : "Latest available period";
+}
+
+function buildSummaryDocumentText({ documents, ragChunks }) {
+  const pageLines = [];
+  let page = 1;
+
+  if (Array.isArray(ragChunks) && ragChunks.length > 0) {
+    for (const chunk of ragChunks.slice(0, 14)) {
+      const chunkText = safeSummaryString(chunk?.chunk_text || "", 1800);
+      if (!chunkText) {
+        continue;
+      }
+      pageLines.push(`p${page}: ${chunkText}`);
+      page += 1;
+    }
+  }
+
+  if (pageLines.length < 6 && Array.isArray(documents)) {
+    for (const document of documents.slice(0, 8)) {
+      const text = safeSummaryString(document?.rag_excerpt || document?.description || "", 1500);
+      if (!text) {
+        continue;
+      }
+      pageLines.push(`p${page}: ${text}`);
+      page += 1;
+      if (pageLines.length >= 14) {
+        break;
+      }
+    }
+  }
+
+  if (pageLines.length === 0) {
+    pageLines.push(`p1: ${NOT_CLEARLY_DISCLOSED_TEXT}`);
+  }
+
+  return pageLines.join("\n\n").slice(0, SUMMARY_JSON_MAX_DOCUMENT_TEXT);
+}
+
+function normalizeStructuredSummaryPayload(rawPayload, options = {}) {
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+    throw new Error("Summary payload is not a JSON object.");
+  }
+
+  const fallbackTitle = `${options.companyName || "Company"} ${options.period || "Summary"}`.trim();
+  const summaryTitle = safeSummaryString(rawPayload.summary_title || fallbackTitle, 140) || fallbackTitle;
+  const intro = trimToWordLimit(rawPayload.intro || NOT_CLEARLY_DISCLOSED_TEXT, 120) || NOT_CLEARLY_DISCLOSED_TEXT;
+
+  const sectionSource = Array.isArray(rawPayload.sections) ? rawPayload.sections : [];
+  const sectionFallbackOrder = REQUIRED_SUMMARY_SECTION_HEADERS.slice(0, SUMMARY_JSON_MAX_SECTIONS);
+  const normalizedSections = sectionSource
+    .map((section, index) => normalizeSummarySection(section, sectionFallbackOrder[index] || `Section ${index + 1}`))
+    .filter((section) => Boolean(section))
+    .slice(0, SUMMARY_JSON_MAX_SECTIONS);
+
+  if (normalizedSections.length < SUMMARY_JSON_MIN_SECTIONS) {
+    for (let index = normalizedSections.length; index < SUMMARY_JSON_MIN_SECTIONS; index += 1) {
+      normalizedSections.push({
+        heading: sectionFallbackOrder[index] || `Section ${index + 1}`,
+        items: [NOT_CLEARLY_DISCLOSED_TEXT, NOT_CLEARLY_DISCLOSED_TEXT],
+      });
+    }
+  }
+
+  const keyMetricsSource = Array.isArray(rawPayload.key_metrics) ? rawPayload.key_metrics : [];
+  const keyMetrics = keyMetricsSource
+    .map((metric) => normalizeSummaryMetric(metric))
+    .filter((metric) => Boolean(metric))
+    .slice(0, SUMMARY_JSON_MAX_METRICS);
+  while (keyMetrics.length < SUMMARY_JSON_MIN_METRICS) {
+    const metricNumber = keyMetrics.length + 1;
+    keyMetrics.push({
+      metric: `Metric ${metricNumber}`,
+      value: NOT_CLEARLY_DISCLOSED_TEXT,
+      what_it_means: NOT_CLEARLY_DISCLOSED_TEXT,
+    });
+  }
+
+  const risksAndUnknowns = toSummaryItems(rawPayload.risks_and_unknowns, [
+    NOT_CLEARLY_DISCLOSED_TEXT,
+    NOT_CLEARLY_DISCLOSED_TEXT,
+  ]);
+  const mustInclude = toSummaryItems(rawPayload.must_include, [
+    "Business model, growth drivers, key metrics, and management commentary should be included.",
+    "Risks, unknowns, and consistency checks across disclosures should be included.",
+  ]);
+
+  const normalized = {
+    summary_title: summaryTitle,
+    intro,
+    sections: normalizedSections,
+    key_metrics: keyMetrics,
+    risks_and_unknowns: risksAndUnknowns,
+    must_include: mustInclude,
+  };
+
+  const serialized = JSON.stringify(normalized);
+  if (hasForbiddenMarkdown(serialized)) {
+    throw new Error("Summary payload contains markdown formatting.");
+  }
+
+  return normalized;
+}
+
+function buildStructuredSummaryPrompts({ companyName, period, documentText }) {
+  const systemPrompt = [
+    "You are a financial document summarization assistant.",
+    "",
+    "TASK",
+    "Create a beginner-friendly summary of the provided company document.",
+  ].join("\n");
+
+  const developerPrompt = [
+    "OUTPUT CONTRACT (STRICT)",
+    "Return ONLY valid JSON. No markdown. No prose outside JSON. No code fences.",
+    "",
+    "JSON schema:",
+    "{",
+    '  "summary_title": "string",',
+    '  "intro": "string (2-3 sentences)",',
+    '  "sections": [',
+    "    {",
+    '      "heading": "string",',
+    '      "items": [',
+    '        "string",',
+    '        "string"',
+    "      ]",
+    "    }",
+    "  ],",
+    '  "key_metrics": [',
+    "    {",
+    '      "metric": "string",',
+    '      "value": "string",',
+    '      "what_it_means": "string"',
+    "    }",
+    "  ],",
+    '  "risks_and_unknowns": [',
+    '    "string",',
+    '    "string"',
+    "  ],",
+    '  "must_include": [',
+    '    "string",',
+    '    "string"',
+    "  ]",
+    "}",
+    "",
+    "FORMATTING RULES (MANDATORY)",
+    "1) Do NOT use markdown bullets: \"*\", \"-\", \"+\".",
+    "2) Do NOT use markdown emphasis: \"**text**\", \"__text__\", \"*text*\", \"_text_\".",
+    "3) Do NOT include \"#\" headings or numbered markdown syntax.",
+    "4) All structure must be represented only through JSON keys and arrays.",
+    "5) Keep language simple, factual, and non-promotional.",
+    `6) If a detail is not clearly disclosed, write: "${NOT_CLEARLY_DISCLOSED_TEXT}"`,
+    "",
+    "CONTENT RULES",
+    "1) Ground every claim in the provided text.",
+    "2) Prioritize: business model, growth drivers, key financial metrics, management commentary, risks, and what beginners should focus on.",
+    "3) Avoid duplication across sections.",
+    "4) Keep each item concise (max 55 words).",
+    "5) Include 5-10 key metrics if available.",
+    "6) No investment advice.",
+    "",
+    "QUALITY CHECK BEFORE FINALIZING",
+    "- Ensure output is valid JSON parseable by JSON.parse.",
+    "- Ensure no markdown symbols are present.",
+    "- Ensure no repeated points across sections.",
+    "- Ensure uncertain claims are explicitly marked as not clearly disclosed.",
+  ].join("\n");
+
+  const userPrompt = [
+    "INPUT",
+    `Company: ${companyName}`,
+    `Period: ${period}`,
+    "Document text:",
+    documentText,
+  ].join("\n");
+
+  return {
+    systemPrompt: `${systemPrompt}\n\n${developerPrompt}`,
+    userPrompt,
+  };
+}
+
+async function generateStructuredSummaryJson({
+  companyName,
+  period,
+  documentText,
+  history = [],
+}) {
+  const prompts = buildStructuredSummaryPrompts({
+    companyName,
+    period,
+    documentText,
+  });
+
+  const completion = await requestChatCompletionWithFallback({
+    systemPrompt: prompts.systemPrompt,
+    history,
+    userPrompt: prompts.userPrompt,
+    temperature: 0.12,
+    responseMimeType: "application/json",
+  });
+
+  const firstParsed = tryParseJson(`${completion.text || ""}`);
+  try {
+    return {
+      summary: normalizeStructuredSummaryPayload(firstParsed, { companyName, period }),
+      modelUsed: completion.modelUsed,
+      repaired: false,
+    };
+  } catch (firstError) {
+    const repairPrompt = [
+      "Repair the JSON so it matches the exact schema and rules.",
+      "Return JSON only.",
+      `If unknown, use: "${NOT_CLEARLY_DISCLOSED_TEXT}"`,
+      `Company: ${companyName}`,
+      `Period: ${period}`,
+      "Original output:",
+      `${completion.text || ""}`,
+      "Document text:",
+      documentText,
+    ].join("\n\n");
+
+    const repairedCompletion = await requestChatCompletionWithFallback({
+      systemPrompt: `${prompts.systemPrompt}\n\nRepair invalid JSON output without adding unsupported claims.`,
+      history: [],
+      userPrompt: repairPrompt,
+      temperature: 0.05,
+      responseMimeType: "application/json",
+    });
+
+    const repairedParsed = tryParseJson(`${repairedCompletion.text || ""}`);
+    return {
+      summary: normalizeStructuredSummaryPayload(repairedParsed, { companyName, period }),
+      modelUsed: repairedCompletion.modelUsed || completion.modelUsed,
+      repaired: true,
+      repairError: firstError instanceof Error ? firstError.message : "invalid summary json",
+    };
+  }
+}
+
 function buildXaiHistory(history) {
   return history
     .slice(-6)
@@ -2239,7 +2572,17 @@ async function enforceAnswerQualityWithRewrite({
   }
 }
 
-async function answerWithGrok({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
+async function answerWithGrok({
+  question,
+  companyName,
+  symbol,
+  documents,
+  history,
+  isSummaryRequest,
+  ragChunks,
+  year,
+  quarter,
+}) {
   if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
     throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY on the backend.");
   }
@@ -2251,6 +2594,36 @@ async function answerWithGrok({ question, companyName, symbol, documents, histor
   const contextLines = buildContextLines(documents);
   const chunkLines = buildChunkContextLines(Array.isArray(ragChunks) ? ragChunks : []);
   const hasChunkEvidence = chunkLines.length > 0;
+
+  if (isSummaryRequest) {
+    try {
+      const summaryPeriod = inferPeriodLabel({
+        year,
+        quarter,
+        documents,
+      });
+      const summaryDocumentText = buildSummaryDocumentText({
+        documents,
+        ragChunks,
+      });
+      const structuredSummaryResult = await generateStructuredSummaryJson({
+        companyName: companyName || symbol,
+        period: summaryPeriod,
+        documentText: summaryDocumentText,
+        history: [],
+      });
+
+      return {
+        answer: JSON.stringify(structuredSummaryResult.summary, null, 2),
+        structured_summary: structuredSummaryResult.summary,
+        modelUsed: structuredSummaryResult.modelUsed,
+        quality_repair_applied: Boolean(structuredSummaryResult.repaired),
+      };
+    } catch (error) {
+      console.error("Structured summary generation failed, falling back to narrative summary:", error?.message || error);
+    }
+  }
+
   const citationProtocol = hasChunkEvidence
     ? [
         "Citation protocol:",
@@ -3103,6 +3476,7 @@ app.post("/api/chat", async (req, res) => {
     let answerModelUsed = getDefaultModelUsed();
     let qualityRepairApplied = false;
     let llmErrorMessage = "";
+    let structuredSummary = null;
     try {
       const llmAnswer = await answerWithGrok({
         question,
@@ -3112,10 +3486,13 @@ app.post("/api/chat", async (req, res) => {
         ragChunks,
         history,
         isSummaryRequest,
+        year,
+        quarter,
       });
       answer = llmAnswer.answer;
       answerModelUsed = llmAnswer.modelUsed;
       qualityRepairApplied = Boolean(llmAnswer.quality_repair_applied);
+      structuredSummary = llmAnswer.structured_summary || null;
     } catch (error) {
       llmErrorMessage = error instanceof Error ? error.message : "LLM request failed while answering this query.";
       console.error(`LLM answer generation failed for ${symbol}:`, llmErrorMessage);
@@ -3135,6 +3512,7 @@ app.post("/api/chat", async (req, res) => {
           });
       answerModelUsed = "fallback:rule-based";
       qualityRepairApplied = false;
+      structuredSummary = null;
     }
 
     if (!answer) {
@@ -3154,7 +3532,9 @@ app.post("/api/chat", async (req, res) => {
           });
     }
 
-    answer = finalizeAnswer(answer, { ragChunks });
+    if (!structuredSummary) {
+      answer = finalizeAnswer(answer, { ragChunks });
+    }
 
     const sources = blendedSources;
     const followUpQuestions = buildFollowUpQuestions({
@@ -3166,6 +3546,7 @@ app.post("/api/chat", async (req, res) => {
 
     res.json({
       answer,
+      ...(structuredSummary ? { structured_summary: structuredSummary } : {}),
       sources,
       follow_up_questions: followUpQuestions,
       meta: {

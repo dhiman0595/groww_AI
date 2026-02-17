@@ -25,6 +25,21 @@ export interface ChatResponse {
   answer: string;
   sources: ChatSource[];
   follow_up_questions: string[];
+  structured_summary?: {
+    summary_title: string;
+    intro: string;
+    sections: Array<{
+      heading: string;
+      items: string[];
+    }>;
+    key_metrics: Array<{
+      metric: string;
+      value: string;
+      what_it_means: string;
+    }>;
+    risks_and_unknowns: string[];
+    must_include: string[];
+  };
 }
 
 export interface SummaryCard {
@@ -102,6 +117,10 @@ export async function fetchChatAnswer(payload: ChatRequest): Promise<ChatRespons
     answer: typeof parsed.answer === "string" ? parsed.answer : "No answer returned.",
     sources: Array.isArray(parsed.sources) ? parsed.sources : [],
     follow_up_questions: Array.isArray(parsed.follow_up_questions) ? parsed.follow_up_questions : [],
+    structured_summary:
+      parsed.structured_summary && typeof parsed.structured_summary === "object"
+        ? (parsed.structured_summary as ChatResponse["structured_summary"])
+        : undefined,
   };
 }
 
