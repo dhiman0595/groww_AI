@@ -6,6 +6,16 @@ const FILINGS_FEED_ENDPOINT = `${
 }`.trim();
 const FILINGS_FEED_API_KEY = `${process.env.STOCKINSIGHTS_API_KEY || ""}`.trim();
 const FILINGS_FEED_COMPANY_PARAM = `${process.env.STOCKINSIGHTS_COMPANY_PARAM || "ticker"}`.trim() || "ticker";
+const FILINGS_FEED_TIMEOUT_MS = Math.max(1500, Math.min(Number(process.env.STOCKINSIGHTS_TIMEOUT_MS || 8000), 30000));
+const FILINGS_FEED_CACHE_TTL_MS = Math.max(
+  5000,
+  Math.min(Number(process.env.STOCKINSIGHTS_CACHE_TTL_MS || 120000), 900000)
+);
+const FILINGS_FEED_CACHE_MAX_ENTRIES = Math.max(
+  32,
+  Math.min(Number(process.env.STOCKINSIGHTS_CACHE_MAX_ENTRIES || 400), 5000)
+);
+const FILINGS_FEED_CACHE_STALE_MULTIPLIER = 4;
 
 const SUPPORTED_DOCUMENT_TYPES = [
   "annual-report",
@@ -14,6 +24,8 @@ const SUPPORTED_DOCUMENT_TYPES = [
   "investor-presentation",
   "announcement",
 ];
+const feedDocumentsCache = new Map();
+const feedDocumentsInFlight = new Map();
 
 function cleanText(value) {
   return `${value || ""}`.trim();
@@ -21,6 +33,82 @@ function cleanText(value) {
 
 function cleanUpperText(value) {
   return cleanText(value).toUpperCase();
+}
+
+function buildFeedCacheKey(options) {
+  const symbol = cleanUpperText(options.symbol);
+  const documentType = normalizeRequestedType(options.documentType || "ALL");
+  const companyParam = cleanText(options.companyParam || FILINGS_FEED_COMPANY_PARAM);
+  return `${symbol}|${documentType}|${companyParam}`;
+}
+
+function getCacheEntry(cacheKey) {
+  const entry = feedDocumentsCache.get(cacheKey);
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  return entry;
+}
+
+function getCachedFeedDocuments(cacheKey, options = {}) {
+  const entry = getCacheEntry(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  const now = Date.now();
+  const allowStale = options.allowStale === true;
+  const staleUntil = Number(entry.staleUntil) || 0;
+  const expiresAt = Number(entry.expiresAt) || 0;
+
+  if (allowStale && staleUntil > now) {
+    return Array.isArray(entry.items) ? entry.items : [];
+  }
+
+  if (expiresAt > now) {
+    return Array.isArray(entry.items) ? entry.items : [];
+  }
+
+  return null;
+}
+
+function pruneFeedCache() {
+  const now = Date.now();
+
+  for (const [key, entry] of feedDocumentsCache.entries()) {
+    const staleUntil = Number(entry?.staleUntil) || 0;
+    if (staleUntil <= now) {
+      feedDocumentsCache.delete(key);
+    }
+  }
+
+  if (feedDocumentsCache.size <= FILINGS_FEED_CACHE_MAX_ENTRIES) {
+    return;
+  }
+
+  const sortedEntries = Array.from(feedDocumentsCache.entries()).sort((left, right) => {
+    const leftUpdated = Number(left?.[1]?.updatedAt) || 0;
+    const rightUpdated = Number(right?.[1]?.updatedAt) || 0;
+    return leftUpdated - rightUpdated;
+  });
+  const overflowCount = feedDocumentsCache.size - FILINGS_FEED_CACHE_MAX_ENTRIES;
+  for (let index = 0; index < overflowCount; index += 1) {
+    const key = sortedEntries[index]?.[0];
+    if (key) {
+      feedDocumentsCache.delete(key);
+    }
+  }
+}
+
+function setCachedFeedDocuments(cacheKey, items) {
+  const now = Date.now();
+  feedDocumentsCache.set(cacheKey, {
+    items: Array.isArray(items) ? items : [],
+    updatedAt: now,
+    expiresAt: now + FILINGS_FEED_CACHE_TTL_MS,
+    staleUntil: now + FILINGS_FEED_CACHE_TTL_MS * FILINGS_FEED_CACHE_STALE_MULTIPLIER,
+  });
+  pruneFeedCache();
 }
 
 function normalizeRequestedType(value) {
@@ -394,13 +482,29 @@ async function fetchFeedDocumentsByType(options) {
   let lastUnauthorizedMessage = "";
 
   for (const authHeaders of authHeaderVariants) {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        ...authHeaders,
-        Accept: "application/json",
-      },
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, FILINGS_FEED_TIMEOUT_MS);
+    let response;
+
+    try {
+      response = await fetch(url, {
+        method: "GET",
+        headers: {
+          ...authHeaders,
+          Accept: "application/json",
+        },
+        signal: controller.signal,
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error && typeof error === "object" && error.name === "AbortError") {
+        throw new Error(`Filings feed timed out after ${FILINGS_FEED_TIMEOUT_MS}ms.`);
+      }
+      throw error;
+    }
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       if (response.status === 401 || response.status === 403) {
@@ -422,6 +526,38 @@ async function fetchFeedDocumentsByType(options) {
   throw new Error(`Filings feed unauthorized. ${lastUnauthorizedMessage}`);
 }
 
+async function fetchFeedDocumentsByTypeCached(options) {
+  const cacheKey = buildFeedCacheKey(options);
+  const freshCached = getCachedFeedDocuments(cacheKey);
+  if (freshCached !== null) {
+    return freshCached;
+  }
+
+  if (feedDocumentsInFlight.has(cacheKey)) {
+    return feedDocumentsInFlight.get(cacheKey);
+  }
+
+  const pending = (async () => {
+    try {
+      const documents = await fetchFeedDocumentsByType(options);
+      setCachedFeedDocuments(cacheKey, documents);
+      return documents;
+    } catch (error) {
+      const staleCached = getCachedFeedDocuments(cacheKey, { allowStale: true });
+      if (staleCached !== null) {
+        console.warn(`Using stale filings cache for ${cacheKey}: ${error.message}`);
+        return staleCached;
+      }
+      throw error;
+    } finally {
+      feedDocumentsInFlight.delete(cacheKey);
+    }
+  })();
+
+  feedDocumentsInFlight.set(cacheKey, pending);
+  return pending;
+}
+
 async function fetchFilingsFeedDocuments(options = {}) {
   if (!hasFilingsFeedConfig()) {
     return [];
@@ -436,7 +572,7 @@ async function fetchFilingsFeedDocuments(options = {}) {
   try {
     const chunks = await Promise.all(
       requestedTypes.map((documentType) =>
-        fetchFeedDocumentsByType({
+        fetchFeedDocumentsByTypeCached({
           symbol,
           documentType,
           companyParam: options.companyParam,

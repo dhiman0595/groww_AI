@@ -14,6 +14,11 @@ import type {
 
 const DOCS_MODE = (import.meta.env.VITE_DOCS_MODE ?? "real").trim().toLowerCase();
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
+const COMPANIES_CACHE_TTL_MS = 120_000;
+const DOCUMENTS_CACHE_TTL_MS = 60_000;
+const companiesCache = new Map<string, { expiresAt: number; value: CompanyOption[] }>();
+const documentsCache = new Map<string, { expiresAt: number; value: DocumentsResponse }>();
+const documentsInFlight = new Map<string, Promise<DocumentsResponse>>();
 
 function isMockMode(): boolean {
   return DOCS_MODE === "mock";
@@ -39,6 +44,67 @@ function toQueryString(params: Record<string, string | number | undefined>): str
 
   const serialized = searchParams.toString();
   return serialized ? `?${serialized}` : "";
+}
+
+function nowTs(): number {
+  return Date.now();
+}
+
+function getCachedCompanies(cacheKey: string): CompanyOption[] | null {
+  const cached = companiesCache.get(cacheKey);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt <= nowTs()) {
+    companiesCache.delete(cacheKey);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedCompanies(cacheKey: string, value: CompanyOption[]): void {
+  companiesCache.set(cacheKey, {
+    value,
+    expiresAt: nowTs() + COMPANIES_CACHE_TTL_MS,
+  });
+}
+
+function getCachedDocuments(cacheKey: string): DocumentsResponse | null {
+  const cached = documentsCache.get(cacheKey);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt <= nowTs()) {
+    documentsCache.delete(cacheKey);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedDocuments(cacheKey: string, value: DocumentsResponse): void {
+  documentsCache.set(cacheKey, {
+    value,
+    expiresAt: nowTs() + DOCUMENTS_CACHE_TTL_MS,
+  });
+}
+
+function buildCompaniesCacheKey(query?: string, limitOverride?: number): string {
+  const normalizedQuery = `${query || ""}`.trim().toLowerCase();
+  const normalizedLimit = Number.isFinite(limitOverride) ? Math.max(1, Math.floor(Number(limitOverride))) : 0;
+  return `${normalizedQuery}|${normalizedLimit}`;
+}
+
+function buildDocumentsCacheKey(params: DocumentsQueryParams): string {
+  return [
+    params.symbol.trim().toUpperCase(),
+    params.doc_type || "",
+    params.q || "",
+    params.from || "",
+    params.to || "",
+    params.sort || "",
+    Number(params.page || 1),
+    Number(params.page_size || 10),
+  ].join("|");
 }
 
 async function getMockRawItems(): Promise<RawSourceDocument[]> {
@@ -79,6 +145,12 @@ export async function fetchCompanies(
     return [];
   }
 
+  const cacheKey = buildCompaniesCacheKey(normalizedQuery, limitOverride);
+  const cached = getCachedCompanies(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   const dynamicLimit = normalizedQuery ? 300 : 100;
   const requestedLimit = Number.isFinite(limitOverride)
     ? Math.max(1, Math.min(Math.floor(Number(limitOverride)), dynamicLimit))
@@ -101,6 +173,7 @@ export async function fetchCompanies(
 
   const payload = (await response.json()) as RawCompaniesResponse;
   const filtered = filterCompaniesByQuery(payload.companies, query);
+  setCachedCompanies(cacheKey, filtered);
   if (Number.isFinite(limitOverride)) {
     return filtered.slice(0, Math.max(1, Math.floor(Number(limitOverride))));
   }
@@ -113,34 +186,55 @@ export async function fetchDocuments(params: DocumentsQueryParams): Promise<Docu
     return applyDocumentsQuery(normalized, params);
   }
 
-  const endpoint = withBaseUrl(
-    `/api/documents${toQueryString({
-      symbol: params.symbol,
-      doc_type: params.doc_type,
-      q: params.q,
-      from: params.from,
-      to: params.to,
-      sort: params.sort,
-      page: params.page,
-      page_size: params.page_size,
-    })}`
-  );
-
-  const response = await fetch(endpoint);
-
-  if (!response.ok) {
-    throw new Error("Failed to load documents from API.");
+  const cacheKey = buildDocumentsCacheKey(params);
+  const cached = getCachedDocuments(cacheKey);
+  if (cached) {
+    return cached;
   }
 
-  const payload = (await response.json()) as RawDocumentsResponse;
-  const normalized = normalizeRawDocuments(payload.items);
+  if (documentsInFlight.has(cacheKey)) {
+    return documentsInFlight.get(cacheKey)!;
+  }
 
-  return {
-    items: normalized,
-    total: payload.total,
-    page: payload.page,
-    page_size: payload.page_size,
-  };
+  const pending = (async () => {
+    const endpoint = withBaseUrl(
+      `/api/documents${toQueryString({
+        symbol: params.symbol,
+        doc_type: params.doc_type,
+        q: params.q,
+        from: params.from,
+        to: params.to,
+        sort: params.sort,
+        page: params.page,
+        page_size: params.page_size,
+      })}`
+    );
+
+    const response = await fetch(endpoint);
+
+    if (!response.ok) {
+      throw new Error("Failed to load documents from API.");
+    }
+
+    const payload = (await response.json()) as RawDocumentsResponse;
+    const normalized = normalizeRawDocuments(payload.items);
+
+    const result: DocumentsResponse = {
+      items: normalized,
+      total: payload.total,
+      page: payload.page,
+      page_size: payload.page_size,
+    };
+    setCachedDocuments(cacheKey, result);
+    return result;
+  })();
+
+  documentsInFlight.set(cacheKey, pending);
+  try {
+    return await pending;
+  } finally {
+    documentsInFlight.delete(cacheKey);
+  }
 }
 
 export function getDocsModeLabel(): "mock" | "real" {

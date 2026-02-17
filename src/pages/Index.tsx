@@ -65,13 +65,14 @@ const ROW_DOC_TYPES = new Set<CompanyDocument["doc_type"]>([
 const SUMMARY_DECK_STORAGE_PREFIX = "summary-cards-v1";
 const SWIPE_THRESHOLD = 70;
 const CHAT_RENDER_LIMIT = 60;
+const DEFAULT_FILINGS_DOC_TYPE: DocumentTypeFilter = "quarterly-result";
 const FILINGS_DOC_TYPE_OPTIONS: Array<{ value: DocumentTypeFilter; label: string }> = [
-  { value: "ALL", label: "All documents" },
-  { value: "annual-report", label: "Annual Report" },
   { value: "quarterly-result", label: "Quarterly Result" },
   { value: "earnings-transcript", label: "Earnings Transcript" },
-  { value: "investor-presentation", label: "Investor Presentation" },
   { value: "announcement", label: "Announcement" },
+  { value: "investor-presentation", label: "Investor Presentation" },
+  { value: "annual-report", label: "Annual Report" },
+  { value: "ALL", label: "All documents" },
 ];
 
 const SummaryDeckView = lazy(() =>
@@ -351,12 +352,12 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
     setCompanySearchText("");
   }, [companySearchText, effectiveSelectedSymbol, isGuestMode, selectableCompanies]);
 
-  const selectedDocumentType = selectedDocTypeBySymbol[effectiveSelectedSymbol] ?? "ALL";
+  const selectedDocumentType = selectedDocTypeBySymbol[effectiveSelectedSymbol] ?? DEFAULT_FILINGS_DOC_TYPE;
   const documentsQuery = useDocumentsQuery({
     symbol: effectiveSelectedSymbol,
     doc_type: selectedDocumentType,
     page: 1,
-    page_size: 40,
+    page_size: 20,
   });
 
   const companyDocuments = documentsQuery.data.items;
@@ -404,7 +405,7 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
 
       return {
         ...previous,
-        [effectiveSelectedSymbol]: "ALL",
+        [effectiveSelectedSymbol]: DEFAULT_FILINGS_DOC_TYPE,
       };
     });
   }, [effectiveSelectedSymbol]);
