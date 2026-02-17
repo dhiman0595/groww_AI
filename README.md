@@ -49,10 +49,12 @@ XAI_API_KEY=...
 XAI_MODEL=grok-3-mini
 XAI_EMBEDDING_MODEL=...
 
-AUTH_OTP_MODE=demo
 AUTH_OTP_TTL_MS=300000
 AUTH_OTP_MAX_ATTEMPTS=5
+AUTH_OTP_RESEND_COOLDOWN_MS=20000
 ```
+
+OTP is demo-only right now. `POST /api/auth/request-otp` returns `demo_otp` for verification.
 
 ## Import Company Master (ISIN Mapping)
 

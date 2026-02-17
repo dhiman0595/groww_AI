@@ -69,7 +69,6 @@ const RAG_CHUNK_CHAR_SIZE = Math.max(500, Math.min(Number(process.env.RAG_CHUNK_
 const RAG_CHUNK_OVERLAP = Math.max(50, Math.min(Number(process.env.RAG_CHUNK_OVERLAP || 180), 600));
 const RAG_RETRIEVAL_LIMIT = Math.max(2, Math.min(Number(process.env.RAG_RETRIEVAL_LIMIT || 8), 20));
 const RAG_EMBEDDING_INPUT_CHARS = Math.max(200, Math.min(Number(process.env.RAG_EMBEDDING_INPUT_CHARS || 2400), 5000));
-const AUTH_OTP_MODE = `${process.env.AUTH_OTP_MODE || "demo"}`.trim().toLowerCase();
 const AUTH_OTP_TTL_MS = Math.max(60_000, Math.min(Number(process.env.AUTH_OTP_TTL_MS || 300_000), 900_000));
 const AUTH_OTP_MAX_ATTEMPTS = Math.max(1, Math.min(Number(process.env.AUTH_OTP_MAX_ATTEMPTS || 5), 10));
 const AUTH_OTP_RESEND_COOLDOWN_MS = Math.max(
@@ -272,6 +271,19 @@ function cleanupExpiredAuthOtps() {
 
 function createOtpCode() {
   return `${randomInt(100000, 1000000)}`;
+}
+
+function normalizeOtpMode() {
+  return "demo";
+}
+
+function deliverOtp(_channel, _identifier, otp) {
+  return {
+    ok: true,
+    mode: "demo",
+    message: "Demo OTP generated. Use the code shown below.",
+    demoOtp: otp,
+  };
 }
 
 function toInternalDocTypeFilter(rawValue) {
@@ -2314,6 +2326,7 @@ app.post("/api/auth/request-otp", (req, res) => {
   }
 
   const otp = createOtpCode();
+  const delivery = deliverOtp(channel, identifier, otp);
   const expiresAt = now + AUTH_OTP_TTL_MS;
   authOtpStore.set(storeKey, {
     otp,
@@ -2324,23 +2337,16 @@ app.post("/api/auth/request-otp", (req, res) => {
     lastSentAt: now,
   });
 
-  const payload = {
+  res.json({
     ok: true,
     channel,
     masked_identifier: maskAuthIdentifier(channel, identifier),
     expires_in_sec: Math.round(AUTH_OTP_TTL_MS / 1000),
-    delivery_mode: AUTH_OTP_MODE,
-    message:
-      AUTH_OTP_MODE === "demo"
-        ? "Demo OTP generated. Use the code shown below."
-        : "OTP generated. Integrate SMS/email provider for delivery.",
-  };
-
-  if (AUTH_OTP_MODE === "demo") {
-    payload.demo_otp = otp;
-  }
-
-  res.json(payload);
+    otp_mode: normalizeOtpMode(),
+    delivery_mode: delivery.mode || "demo",
+    message: delivery.message || "Demo OTP generated. Use the code shown below.",
+    demo_otp: delivery.demoOtp || otp,
+  });
 });
 
 app.post("/api/auth/verify-otp", (req, res) => {
