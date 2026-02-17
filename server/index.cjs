@@ -33,6 +33,7 @@ const {
   searchRagChunksByKeywords,
   upsertRagChunks,
 } = require("./db/ragStore.cjs");
+const { registerFlashcardsRoutes } = require("./ai/flashcards/routes.cjs");
 
 const PORT = Number(process.env.PORT || 8787);
 const OLLAMA_BASE_URL = `${process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434"}`.trim().replace(/\/$/, "");
@@ -2499,6 +2500,13 @@ async function generateSummaryCardsWithGrok({
   };
 }
 
+registerFlashcardsRoutes(app, {
+  resolveDocumentText: async (sourceUrl) => {
+    const text = await fetchPdfText(sourceUrl);
+    return `${text || ""}`.trim();
+  },
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -3190,6 +3198,12 @@ if (HAS_DIST) {
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`Documents API server running on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Documents API server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = {
+  app,
+};

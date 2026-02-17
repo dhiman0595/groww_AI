@@ -23,6 +23,8 @@ import { CompanySelector } from "@/features/documents/components/CompanySelector
 import { useCompaniesQuery } from "@/features/documents/state/useCompaniesQuery";
 import { useDocumentsQuery } from "@/features/documents/state/useDocumentsQuery";
 import type { CompanyDocument, CompanyOption, DocumentTypeFilter } from "@/features/documents/types";
+import { FlashcardsPanel } from "@/features/flashcards/components/FlashcardsPanel";
+import { aiFlashcardsV1 } from "@/features/flashcards/featureFlags";
 
 interface ChatMessage {
   id: string;
@@ -648,6 +650,10 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
     setDragStartX(null);
     setDragOffsetX(0);
 
+    if (aiFlashcardsV1) {
+      return;
+    }
+
     if (!effectiveSelectedSymbol) {
       return;
     }
@@ -1114,24 +1120,34 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
                   </div>
                 }
               >
-                <SummaryDeckView
-                  summaryDocumentTitle={summaryDocument?.title}
-                  activeSummaryDeck={activeSummaryDeck}
-                  currentSummaryCard={currentSummaryCard}
-                  summarySources={summarySources}
-                  dragOffsetX={dragOffsetX}
-                  dragStartX={dragStartX}
-                  onBack={() => setSummaryView(null)}
-                  onPointerDown={handleSummaryCardPointerDown}
-                  onPointerMove={handleSummaryCardPointerMove}
-                  onPointerEnd={handleSummaryCardPointerEnd}
-                  onRequestLeft={() => {
-                    animateAndRequestKnowledgeCard("left");
-                  }}
-                  onRequestRight={() => {
-                    animateAndRequestKnowledgeCard("right");
-                  }}
-                />
+                {aiFlashcardsV1 ? (
+                  <FlashcardsPanel
+                    symbol={effectiveSelectedSymbol}
+                    companyName={selectedCompany?.company_name}
+                    document={summaryDocument}
+                    selectedYear={selectedYear}
+                    onBack={() => setSummaryView(null)}
+                  />
+                ) : (
+                  <SummaryDeckView
+                    summaryDocumentTitle={summaryDocument?.title}
+                    activeSummaryDeck={activeSummaryDeck}
+                    currentSummaryCard={currentSummaryCard}
+                    summarySources={summarySources}
+                    dragOffsetX={dragOffsetX}
+                    dragStartX={dragStartX}
+                    onBack={() => setSummaryView(null)}
+                    onPointerDown={handleSummaryCardPointerDown}
+                    onPointerMove={handleSummaryCardPointerMove}
+                    onPointerEnd={handleSummaryCardPointerEnd}
+                    onRequestLeft={() => {
+                      animateAndRequestKnowledgeCard("left");
+                    }}
+                    onRequestRight={() => {
+                      animateAndRequestKnowledgeCard("right");
+                    }}
+                  />
+                )}
               </Suspense>
             ) : (
               <>
