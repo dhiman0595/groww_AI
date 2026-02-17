@@ -264,8 +264,29 @@ function mapFeedDocumentToRaw(record, context) {
       "timestamp",
     ])
   );
-  const sourceUrl = pickString(record, ["source_url", "url", "link", "page_url", "document_url", "web_url"]);
-  const fileUrl = pickString(record, ["file_url", "pdf_url", "download_url", "attachment_url", "transcript_url"]);
+  let sourceUrl = pickString(record, [
+    "source_url",
+    "url",
+    "link",
+    "page_url",
+    "document_url",
+    "web_url",
+    "company_page_url",
+  ]);
+  const fileUrl = pickString(record, [
+    "file_url",
+    "pdf_url",
+    "download_url",
+    "attachment_url",
+    "transcript_url",
+    "pdf_link",
+    "pdfLink",
+    "document_pdf_url",
+    "filing_pdf_url",
+  ]);
+  if (sourceUrl.startsWith("/")) {
+    sourceUrl = `https://stockinsights.ai${sourceUrl}`;
+  }
   const isin = cleanUpperText(pickString(record, ["isin", "isin_code"]));
   const exchange = cleanUpperText(pickString(record, ["exchange", "stock_exchange", "source_exchange"]));
 

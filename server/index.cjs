@@ -678,8 +678,38 @@ function looksLikePdfUrl(url) {
     normalized.includes(".pdf") ||
     normalized.includes("annpdfopen") ||
     normalized.includes("/announcements/") ||
-    normalized.includes("s3.amazonaws.com")
+    normalized.includes("s3.amazonaws.com") ||
+    normalized.includes("filings.stockinsights.ai")
   );
+}
+
+function buildPdfFetchHeaders(url) {
+  const fallback = {
+    Accept: "application/pdf,*/*",
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  try {
+    const hostname = new URL(`${url || ""}`).hostname.toLowerCase();
+    if (hostname.includes("nseindia.com") || hostname.includes("nsearchives.nseindia.com")) {
+      return {
+        ...fallback,
+        Referer: "https://www.nseindia.com/",
+      };
+    }
+    if (hostname.includes("bseindia.com")) {
+      return {
+        ...fallback,
+        Referer: "https://www.bseindia.com/",
+      };
+    }
+  } catch {
+    // Falls back to generic headers.
+  }
+
+  return fallback;
 }
 
 async function extractPdfText(buffer) {
@@ -726,38 +756,49 @@ async function fetchPdfText(url) {
     const timeout = setTimeout(() => controller.abort(), PDF_TEXT_FETCH_TIMEOUT_MS);
 
     try {
-      const response = await fetch(url, {
-        method: "GET",
-        signal: controller.signal,
-        headers: {
+      const headerCandidates = [
+        buildPdfFetchHeaders(url),
+        {
           Accept: "application/pdf,*/*",
-          "User-Agent": "Groww-AI/1.0 (+https://groww-ai.onrender.com)",
-          Referer: "https://www.bseindia.com/",
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         },
-      });
+      ];
 
-      if (!response.ok) {
-        return "";
+      for (const headers of headerCandidates) {
+        const response = await fetch(url, {
+          method: "GET",
+          signal: controller.signal,
+          headers,
+        });
+
+        if (!response.ok) {
+          continue;
+        }
+
+        const bytes = Number(response.headers.get("content-length") || 0);
+        if (bytes > PDF_TEXT_MAX_BYTES) {
+          continue;
+        }
+
+        const contentType = `${response.headers.get("content-type") || ""}`.toLowerCase();
+        const resolvedUrl = `${response.url || url}`.trim();
+        if (!contentType.includes("pdf") && !looksLikePdfUrl(resolvedUrl) && !looksLikePdfUrl(url)) {
+          continue;
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (!buffer || buffer.length === 0 || buffer.length > PDF_TEXT_MAX_BYTES) {
+          continue;
+        }
+
+        const text = await extractPdfText(buffer);
+        if (text) {
+          return text.slice(0, PDF_TEXT_MAX_CHARS);
+        }
       }
 
-      const bytes = Number(response.headers.get("content-length") || 0);
-      if (bytes > PDF_TEXT_MAX_BYTES) {
-        return "";
-      }
-
-      const contentType = `${response.headers.get("content-type") || ""}`.toLowerCase();
-      const resolvedUrl = `${response.url || url}`.trim();
-      if (!contentType.includes("pdf") && !looksLikePdfUrl(resolvedUrl) && !looksLikePdfUrl(url)) {
-        return "";
-      }
-
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (!buffer || buffer.length === 0 || buffer.length > PDF_TEXT_MAX_BYTES) {
-        return "";
-      }
-
-      const text = await extractPdfText(buffer);
-      return text.slice(0, PDF_TEXT_MAX_CHARS);
+      return "";
     } catch {
       return "";
     } finally {
