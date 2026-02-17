@@ -3,7 +3,6 @@ import {
   useMemo,
   useState,
   type PointerEvent as ReactPointerEvent,
-  type TouchEvent as ReactTouchEvent,
 } from "react";
 import { ArrowLeft, ChevronDown, ChevronUp, SendHorizontal, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -45,6 +44,13 @@ interface SummaryDeckState {
   isLoading: boolean;
   error: string | null;
   sources: ChatSource[];
+}
+
+type IndexAccessMode = "registered" | "guest";
+
+interface IndexPageProps {
+  accessMode?: IndexAccessMode;
+  onLogout?: () => void;
 }
 
 const ROW_DOC_TYPES = new Set<CompanyDocument["doc_type"]>([
@@ -277,7 +283,8 @@ function mergeUniqueCards(existingCards: SummaryCard[], incomingCards: SummaryCa
   return appended.length > 0 ? [...existingCards, ...appended] : existingCards;
 }
 
-export function IndexPage() {
+export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProps) {
+  const isGuestMode = accessMode === "guest";
   const [companySearchText, setCompanySearchText] = useState("");
   const [selectedSymbol, setSelectedSymbol] = useState("");
   const [draftQuestion, setDraftQuestion] = useState("");
@@ -292,20 +299,40 @@ export function IndexPage() {
   const [dragStartX, setDragStartX] = useState<number | null>(null);
   const [dragOffsetX, setDragOffsetX] = useState(0);
 
-  const companiesQuery = useCompaniesQuery(companySearchText);
+  const companiesQuery = useCompaniesQuery(companySearchText, {
+    limit: isGuestMode ? 3 : undefined,
+  });
+  const selectableCompanies = useMemo(
+    () => (isGuestMode ? companiesQuery.data.slice(0, 3) : companiesQuery.data),
+    [companiesQuery.data, isGuestMode]
+  );
   const effectiveSelectedSymbol = selectedSymbol.trim().toUpperCase();
 
   const selectedCompany = useMemo(
     () =>
-      companiesQuery.data.find((company) => company.symbol === effectiveSelectedSymbol) ??
-      (effectiveSelectedSymbol
+      selectableCompanies.find((company) => company.symbol === effectiveSelectedSymbol) ??
+      (!isGuestMode && effectiveSelectedSymbol
         ? {
             symbol: effectiveSelectedSymbol,
             company_name: effectiveSelectedSymbol,
           }
         : null),
-    [companiesQuery.data, effectiveSelectedSymbol]
+    [effectiveSelectedSymbol, isGuestMode, selectableCompanies]
   );
+
+  useEffect(() => {
+    if (!isGuestMode || !effectiveSelectedSymbol) {
+      return;
+    }
+
+    const stillAllowed = selectableCompanies.some((company) => company.symbol === effectiveSelectedSymbol);
+    if (stillAllowed) {
+      return;
+    }
+
+    setSelectedSymbol("");
+    setCompanySearchText("");
+  }, [effectiveSelectedSymbol, isGuestMode, selectableCompanies]);
 
   const selectedDocumentType = selectedDocTypeBySymbol[effectiveSelectedSymbol] ?? "ALL";
   const documentsQuery = useDocumentsQuery({
@@ -502,16 +529,10 @@ export function IndexPage() {
     }
 
     const currentSession = sessionsBySymbol[effectiveSelectedSymbol] ?? createEmptySession();
-    const conversationHistory = [
-      ...currentSession.messages.slice(-6).map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-      {
-        role: "user" as const,
-        content: question,
-      },
-    ];
+    const conversationHistory = currentSession.messages.slice(-6).map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
 
     const userMessage: ChatMessage = {
       id: createMessageId(),
@@ -752,7 +773,7 @@ export function IndexPage() {
   }
 
   function handleSummaryCardPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.pointerType === "touch") {
+    if (event.pointerType === "mouse" && event.button !== 0) {
       return;
     }
 
@@ -762,14 +783,12 @@ export function IndexPage() {
 
     setDragStartX(event.clientX);
     setDragOffsetX(0);
-    event.currentTarget.setPointerCapture(event.pointerId);
+    if (event.pointerType !== "touch") {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
   }
 
   function handleSummaryCardPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.pointerType === "touch") {
-      return;
-    }
-
     if (dragStartX === null) {
       return;
     }
@@ -777,10 +796,6 @@ export function IndexPage() {
   }
 
   function handleSummaryCardPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.pointerType === "touch") {
-      return;
-    }
-
     if (dragStartX === null) {
       return;
     }
@@ -792,56 +807,41 @@ export function IndexPage() {
     applySwipeDelta(delta);
   }
 
-  function handleSummaryCardTouchStart(event: ReactTouchEvent<HTMLDivElement>) {
-    if (!currentSummaryCard || activeSummaryDeck.isLoading || event.touches.length === 0) {
-      return;
-    }
-
-    setDragStartX(event.touches[0].clientX);
-    setDragOffsetX(0);
-  }
-
-  function handleSummaryCardTouchMove(event: ReactTouchEvent<HTMLDivElement>) {
-    if (dragStartX === null || event.touches.length === 0) {
-      return;
-    }
-
-    event.preventDefault();
-    setDragOffsetX(event.touches[0].clientX - dragStartX);
-  }
-
-  function handleSummaryCardTouchEnd() {
-    if (dragStartX === null) {
-      return;
-    }
-
-    const delta = dragOffsetX;
-    applySwipeDelta(delta);
-  }
-
   return (
-    <main className="min-h-dvh bg-slate-100 px-2 py-3">
+    <main className="h-[100dvh] bg-slate-100 px-2 py-2">
       <div className="mx-auto w-full max-w-[430px]">
-        <Card className="flex h-[96dvh] max-h-[96dvh] flex-col overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_24px_70px_-28px_rgba(15,23,42,0.55)]">
-          <header className="shrink-0 space-y-3 border-b border-slate-200 px-4 py-4">
+        <Card className="flex h-[calc(100dvh-1rem)] max-h-[calc(100dvh-1rem)] flex-col overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_24px_70px_-28px_rgba(15,23,42,0.55)]">
+          <header className="max-h-[48dvh] shrink-0 space-y-3 overflow-y-auto border-b border-slate-200 px-4 py-4 [scrollbar-width:thin]">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h1 className="flex items-center gap-2 text-lg font-semibold text-slate-900">
                 <Sparkles className="size-4 text-emerald-600" />
                 Groww AI
               </h1>
-              <Badge className="bg-emerald-100 text-emerald-800 hover:bg-emerald-100">
-                Chat with filings
-              </Badge>
+              <div className="flex items-center gap-1.5">
+                <Badge className={isGuestMode ? "bg-amber-100 text-amber-800 hover:bg-amber-100" : "bg-emerald-100 text-emerald-800 hover:bg-emerald-100"}>
+                  {isGuestMode ? "Guest mode" : "Chat with filings"}
+                </Badge>
+                {onLogout ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-7 px-2 text-[11px]"
+                    onClick={onLogout}
+                  >
+                    Exit
+                  </Button>
+                ) : null}
+              </div>
             </div>
 
             <CompanySelector
-              companies={companiesQuery.data}
+              companies={selectableCompanies}
               selectedSymbol={selectedSymbol}
               searchText={companySearchText}
               onSearchTextChange={setCompanySearchText}
               onSelectSymbol={(symbol) => {
                 setSelectedSymbol(symbol);
-                const company = companiesQuery.data.find((item) => item.symbol === symbol);
+                const company = selectableCompanies.find((item) => item.symbol === symbol);
                 if (company) {
                   setCompanySearchText(company.company_name);
                 }
@@ -849,6 +849,12 @@ export function IndexPage() {
               isLoading={companiesQuery.isLoading}
               error={companiesQuery.error}
             />
+
+            {isGuestMode ? (
+              <p className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-800">
+                Guest access: company search is limited to 3 companies. Register to unlock full universe.
+              </p>
+            ) : null}
 
             {selectedCompany ? (
               <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-2.5">
@@ -880,7 +886,7 @@ export function IndexPage() {
 
                 {isFilingsPanelOpen ? (
                   <>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-1.5">
                       <div className="space-y-1">
                         <Label htmlFor="fy-selection" className="text-[10px] uppercase tracking-wide text-slate-500">
                           FY
@@ -938,7 +944,7 @@ export function IndexPage() {
                       </div>
                     </div>
 
-                    <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
+                    <div className="max-h-40 space-y-1.5 overflow-y-auto pr-1">
                       {documentsQuery.isLoading ? (
                         <p className="text-xs text-slate-500">Loading filings...</p>
                       ) : null}
@@ -960,7 +966,9 @@ export function IndexPage() {
                         ]
                           .filter((value) => value.length > 0)
                           .join(" • ");
-                        const metadataLine = publishedLabel ? `${metadata} | ${publishedLabel}` : metadata;
+                        const metadataLine = publishedLabel
+                          ? `${metadata || "Filing"} | ${publishedLabel}`
+                          : metadata || "Filing";
                         const isSelectedForChat = selectedChatDocument?.id === document.id;
                         const rowDeckKey = toSummaryDeckKey(effectiveSelectedSymbol, document.id);
                         const isRowSummaryLoading = Boolean(summaryDecksByKey[rowDeckKey]?.isLoading);
@@ -1096,19 +1104,16 @@ export function IndexPage() {
                         </div>
 
                         <article
-                          className="relative select-none touch-none rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                          className="relative select-none rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
                           style={{
                             transform: `translateX(${dragOffsetX}px) rotate(${dragOffsetX / 24}deg)`,
                             transition: dragStartX === null ? "transform 180ms ease" : "none",
+                            touchAction: "pan-y",
                           }}
                           onPointerDown={handleSummaryCardPointerDown}
                           onPointerMove={handleSummaryCardPointerMove}
                           onPointerUp={handleSummaryCardPointerEnd}
                           onPointerCancel={handleSummaryCardPointerEnd}
-                          onTouchStart={handleSummaryCardTouchStart}
-                          onTouchMove={handleSummaryCardTouchMove}
-                          onTouchEnd={handleSummaryCardTouchEnd}
-                          onTouchCancel={handleSummaryCardTouchEnd}
                         >
                           <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700">
                             Swipe left: new perspective
@@ -1348,6 +1353,9 @@ export function IndexPage() {
                       <SendHorizontal className="size-4" />
                     </Button>
                   </div>
+                  <p className="mt-1.5 text-[10px] text-slate-500">
+                    For research and learning only. Not investment advice.
+                  </p>
                 </form>
               </>
             )}

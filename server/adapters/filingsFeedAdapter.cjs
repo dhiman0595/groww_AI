@@ -129,6 +129,23 @@ function normalizeApiDocumentType(rawType, fallbackType) {
   return normalizeRequestedType(fallbackType) === "ALL" ? "announcement" : normalizeRequestedType(fallbackType);
 }
 
+function toDocumentTypeLabel(documentType) {
+  switch (documentType) {
+    case "quarterly-result":
+      return "Quarterly Result";
+    case "earnings-transcript":
+      return "Earnings Transcript";
+    case "investor-presentation":
+      return "Investor Presentation";
+    case "announcement":
+      return "Announcement";
+    case "annual-report":
+      return "Annual Report";
+    default:
+      return "Document";
+  }
+}
+
 function toNseCategory(documentType) {
   switch (documentType) {
     case "quarterly-result":
@@ -163,6 +180,52 @@ function buildStableId(seed) {
   return createHash("sha1").update(seed).digest("hex").slice(0, 16);
 }
 
+function inferQuarterFromText(value) {
+  const text = cleanText(value);
+  if (!text) {
+    return "";
+  }
+
+  const normalized = text.toUpperCase();
+  const qMatch = normalized.match(/\bQ([1-4])\b/);
+  if (qMatch?.[1]) {
+    return `Q${qMatch[1]}`;
+  }
+
+  const altMatch = normalized.match(/\b([1-4])Q\b/);
+  if (altMatch?.[1]) {
+    return `Q${altMatch[1]}`;
+  }
+
+  return "";
+}
+
+function inferFiscalYearFromText(value) {
+  const text = cleanText(value);
+  if (!text) {
+    return "";
+  }
+
+  const normalized = text.toUpperCase();
+  const fyMatch = normalized.match(/\bFY\s*'?(\d{2,4})\b/);
+  if (fyMatch?.[1]) {
+    let year = Number(fyMatch[1]);
+    if (Number.isFinite(year)) {
+      if (year < 100) {
+        year += 2000;
+      }
+      return `FY${year}`;
+    }
+  }
+
+  const longMatch = normalized.match(/\bFISCAL\s*YEAR\s*(\d{4})\b/);
+  if (longMatch?.[1]) {
+    return `FY${longMatch[1]}`;
+  }
+
+  return "";
+}
+
 function mapFeedDocumentToRaw(record, context) {
   const documentType = normalizeApiDocumentType(
     pickString(record, ["document_type", "doc_type", "type"]),
@@ -175,11 +238,15 @@ function mapFeedDocumentToRaw(record, context) {
     ) || cleanUpperText(context.symbol);
 
   const companyName = pickString(record, ["company_name", "company", "issuer_name", "security_name", "name"]);
-  const title = pickString(record, ["title", "subject", "headline", "document_title", "name"]) ||
-    `${companyName || symbol || "Company"} ${documentType}`;
+  const title =
+    pickString(record, ["title", "subject", "headline", "document_title", "name"]) ||
+    `${companyName || symbol || "Company"} ${toDocumentTypeLabel(documentType)}`;
   const description = pickString(record, ["description", "summary", "note", "details", "snippet"]);
-  const quarter = pickString(record, ["quarter", "fiscal_quarter", "qtr"]);
-  const fiscalYear = pickString(record, ["fiscal_year", "financial_year", "fy", "year"]);
+  const quarter =
+    pickString(record, ["quarter", "fiscal_quarter", "qtr"]) || inferQuarterFromText(`${title} ${description}`);
+  const fiscalYear =
+    pickString(record, ["fiscal_year", "financial_year", "fy", "year"]) ||
+    inferFiscalYearFromText(`${title} ${description}`);
   const publishedAt = normalizePublishedAtValue(
     pickString(record, [
       "published_date",
@@ -187,8 +254,12 @@ function mapFeedDocumentToRaw(record, context) {
       "published_on",
       "publishedDate",
       "created_at",
+      "updated_at",
+      "updatedAt",
       "document_date",
       "announcement_date",
+      "datetime",
+      "time",
       "date",
       "timestamp",
     ])

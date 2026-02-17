@@ -1,6 +1,7 @@
 const path = require("node:path");
 const fs = require("node:fs");
-const pdfParse = require("pdf-parse");
+const { randomInt, randomUUID } = require("node:crypto");
+const pdfParsePackage = require("pdf-parse");
 const express = require("express");
 const cors = require("cors");
 const { MOCK_SOURCE_FIXTURES } = require("./mock/rawFixtures.cjs");
@@ -26,6 +27,7 @@ const {
   alignEmbeddingDimension,
   ensureRagSchema,
   findIndexedDocIds,
+  getRagStatsBySymbol,
   hasRagDatabase,
   searchRagChunks,
   searchRagChunksByKeywords,
@@ -49,6 +51,14 @@ const HAS_DIST = fs.existsSync(DIST_INDEX_FILE);
 const app = express();
 
 const SUMMARY_REGEX = /\b(summary|summarize|deep analysis|analysis|overview|digest)\b/i;
+const REQUIRED_SUMMARY_SECTION_HEADERS = [
+  "Point-by-point deep analysis",
+  "Business model breakdown",
+  "Key financial metrics and what they indicate",
+  "Management commentary -> numbers -> long-term implications",
+  "Risks, red flags, and consistency checks",
+  "Which points/sections should absolutely be included",
+];
 const PDF_TEXT_FETCH_TIMEOUT_MS = 12000;
 const PDF_TEXT_MAX_BYTES = 12 * 1024 * 1024;
 const PDF_TEXT_MAX_CHARS = 45000;
@@ -59,8 +69,20 @@ const RAG_CHUNK_CHAR_SIZE = Math.max(500, Math.min(Number(process.env.RAG_CHUNK_
 const RAG_CHUNK_OVERLAP = Math.max(50, Math.min(Number(process.env.RAG_CHUNK_OVERLAP || 180), 600));
 const RAG_RETRIEVAL_LIMIT = Math.max(2, Math.min(Number(process.env.RAG_RETRIEVAL_LIMIT || 8), 20));
 const RAG_EMBEDDING_INPUT_CHARS = Math.max(200, Math.min(Number(process.env.RAG_EMBEDDING_INPUT_CHARS || 2400), 5000));
+const AUTH_OTP_MODE = `${process.env.AUTH_OTP_MODE || "demo"}`.trim().toLowerCase();
+const AUTH_OTP_TTL_MS = Math.max(60_000, Math.min(Number(process.env.AUTH_OTP_TTL_MS || 300_000), 900_000));
+const AUTH_OTP_MAX_ATTEMPTS = Math.max(1, Math.min(Number(process.env.AUTH_OTP_MAX_ATTEMPTS || 5), 10));
+const AUTH_OTP_RESEND_COOLDOWN_MS = Math.max(
+  5_000,
+  Math.min(Number(process.env.AUTH_OTP_RESEND_COOLDOWN_MS || 20_000), 120_000)
+);
+const RESEARCH_ONLY_NOTE = "Research-only note: For learning and analysis, not a buy/sell recommendation.";
 const pdfTextCache = new Map();
 const ragIngestionInFlight = new Set();
+const PdfParseClass = typeof pdfParsePackage?.PDFParse === "function" ? pdfParsePackage.PDFParse : null;
+const legacyPdfParse = typeof pdfParsePackage === "function" ? pdfParsePackage : null;
+const authOtpStore = new Map();
+const authSessionStore = new Map();
 
 const HAS_OLLAMA_CHAT = Boolean(OLLAMA_BASE_URL && OLLAMA_MODEL);
 const HAS_XAI_CHAT = Boolean(XAI_API_KEY);
@@ -153,6 +175,103 @@ function shouldFallbackToLexical(error) {
   }
 
   return shouldFallbackToNextProvider(error);
+}
+
+function normalizeAuthChannel(value) {
+  const normalized = `${value || ""}`.trim().toLowerCase();
+  return normalized === "email" ? "email" : normalized === "mobile" ? "mobile" : "";
+}
+
+function normalizeMobileIdentifier(value) {
+  const raw = `${value || ""}`.trim();
+  if (!raw) {
+    return "";
+  }
+
+  const compact = raw.replace(/[^\d+]/g, "");
+  if (compact.startsWith("+")) {
+    return compact;
+  }
+
+  const digitsOnly = compact.replace(/\D/g, "");
+  if (digitsOnly.length === 10) {
+    return `+91${digitsOnly}`;
+  }
+
+  return digitsOnly.length > 0 ? `+${digitsOnly}` : "";
+}
+
+function normalizeEmailIdentifier(value) {
+  return `${value || ""}`.trim().toLowerCase();
+}
+
+function normalizeAuthIdentifier(channel, value) {
+  if (channel === "mobile") {
+    return normalizeMobileIdentifier(value);
+  }
+  if (channel === "email") {
+    return normalizeEmailIdentifier(value);
+  }
+  return "";
+}
+
+function isValidMobile(value) {
+  return /^\+[1-9]\d{9,14}$/.test(`${value || ""}`);
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i.test(`${value || ""}`);
+}
+
+function isValidAuthIdentifier(channel, value) {
+  if (channel === "mobile") {
+    return isValidMobile(value);
+  }
+  if (channel === "email") {
+    return isValidEmail(value);
+  }
+  return false;
+}
+
+function maskAuthIdentifier(channel, value) {
+  const normalized = `${value || ""}`.trim();
+  if (!normalized) {
+    return "";
+  }
+
+  if (channel === "email") {
+    const [name, domain] = normalized.split("@");
+    if (!name || !domain) {
+      return normalized;
+    }
+    if (name.length <= 2) {
+      return `${name[0] || "*"}*@${domain}`;
+    }
+    return `${name.slice(0, 2)}***@${domain}`;
+  }
+
+  const digits = normalized.replace(/\D/g, "");
+  if (digits.length <= 4) {
+    return `***${digits}`;
+  }
+  return `+${"*".repeat(Math.max(0, digits.length - 4))}${digits.slice(-4)}`;
+}
+
+function buildOtpStoreKey(channel, identifier) {
+  return `${channel}:${identifier}`;
+}
+
+function cleanupExpiredAuthOtps() {
+  const now = Date.now();
+  for (const [key, value] of authOtpStore.entries()) {
+    if (!value || value.expiresAt <= now) {
+      authOtpStore.delete(key);
+    }
+  }
+}
+
+function createOtpCode() {
+  return `${randomInt(100000, 1000000)}`;
 }
 
 function toInternalDocTypeFilter(rawValue) {
@@ -494,6 +613,53 @@ function hasMeaningfulDescription(document) {
   return true;
 }
 
+function hasValuableDetails(text) {
+  const normalized = normalizeWhitespace(text);
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized.length >= 130) {
+    return true;
+  }
+
+  const lower = normalized.toLowerCase();
+  const hasNumbers = /\d/.test(normalized);
+  const hasFinanceTerms =
+    /(revenue|sales|profit|pat|ebitda|margin|cash|debt|capex|guidance|growth|order|expense|yield|return|ratio)/i.test(
+      lower
+    );
+
+  return hasNumbers && hasFinanceTerms;
+}
+
+function shouldEnrichWithPdfText(document) {
+  if (!document) {
+    return false;
+  }
+
+  if (!hasMeaningfulDescription(document)) {
+    return true;
+  }
+
+  const normalized = normalizeWhitespace(document.description);
+  if (!hasValuableDetails(normalized)) {
+    return true;
+  }
+
+  const lower = normalized.toLowerCase();
+  const genericPhrases = [
+    "quarterly result",
+    "quarterly results",
+    "corporate announcement",
+    "investor presentation",
+    "earnings transcript",
+    "details enclosed",
+  ];
+
+  return genericPhrases.some((phrase) => lower === phrase || lower.startsWith(`${phrase}.`));
+}
+
 function looksLikePdfUrl(url) {
   const normalized = `${url || ""}`.toLowerCase();
   return (
@@ -504,8 +670,38 @@ function looksLikePdfUrl(url) {
   );
 }
 
+async function extractPdfText(buffer) {
+  if (!buffer || buffer.length === 0) {
+    return "";
+  }
+
+  if (PdfParseClass) {
+    const parser = new PdfParseClass({ data: buffer });
+    try {
+      const partialPages = Array.from({ length: PDF_TEXT_PAGE_LIMIT }, (_, index) => index + 1);
+      const parsed = await parser.getText({ partial: partialPages });
+      return normalizeWhitespace(parsed?.text || "");
+    } finally {
+      try {
+        await parser.destroy();
+      } catch {
+        // no-op
+      }
+    }
+  }
+
+  if (legacyPdfParse) {
+    const parsed = await legacyPdfParse(buffer, {
+      max: PDF_TEXT_PAGE_LIMIT,
+    });
+    return normalizeWhitespace(parsed?.text || "");
+  }
+
+  return "";
+}
+
 async function fetchPdfText(url) {
-  if (!url || !looksLikePdfUrl(url)) {
+  if (!url) {
     return "";
   }
 
@@ -538,7 +734,8 @@ async function fetchPdfText(url) {
       }
 
       const contentType = `${response.headers.get("content-type") || ""}`.toLowerCase();
-      if (!contentType.includes("pdf") && !looksLikePdfUrl(url)) {
+      const resolvedUrl = `${response.url || url}`.trim();
+      if (!contentType.includes("pdf") && !looksLikePdfUrl(resolvedUrl) && !looksLikePdfUrl(url)) {
         return "";
       }
 
@@ -547,11 +744,7 @@ async function fetchPdfText(url) {
         return "";
       }
 
-      const parsed = await pdfParse(buffer, {
-        max: PDF_TEXT_PAGE_LIMIT,
-      });
-
-      const text = normalizeWhitespace(parsed?.text || "");
+      const text = await extractPdfText(buffer);
       return text.slice(0, PDF_TEXT_MAX_CHARS);
     } catch {
       return "";
@@ -567,7 +760,7 @@ async function fetchPdfText(url) {
 async function enrichDocumentsWithPdfText(documents) {
   return Promise.all(
     documents.map(async (document) => {
-      if (!document || hasMeaningfulDescription(document)) {
+      if (!document || !shouldEnrichWithPdfText(document)) {
         return document;
       }
 
@@ -580,7 +773,7 @@ async function enrichDocumentsWithPdfText(documents) {
       return {
         ...document,
         rag_excerpt: ragText,
-        description: ragText.slice(0, 420),
+        description: hasMeaningfulDescription(document) ? document.description : ragText.slice(0, 420),
       };
     })
   );
@@ -971,12 +1164,18 @@ async function retrieveRagChunksForQuestion(options = {}) {
   const limit = Math.max(2, Math.min(Number(options.limit) || RAG_RETRIEVAL_LIMIT, 20));
 
   if (!symbol || !question || !hasRagDatabase()) {
-    return [];
+    return {
+      chunks: [],
+      mode: "none",
+    };
   }
 
   const schemaReady = await ensureRagSchema();
   if (!schemaReady) {
-    return [];
+    return {
+      chunks: [],
+      mode: "none",
+    };
   }
 
   if (HAS_OLLAMA_EMBEDDINGS || HAS_GEMINI_EMBEDDINGS || HAS_XAI_EMBEDDINGS) {
@@ -989,13 +1188,19 @@ async function retrieveRagChunksForQuestion(options = {}) {
 
     if (Array.isArray(queryEmbedding) && queryEmbedding.length > 0) {
       try {
-        return await searchRagChunks({
+        const vectorChunks = await searchRagChunks({
           symbol,
           embedding: queryEmbedding,
           docIds,
           year,
           limit,
         });
+        if (vectorChunks.length > 0) {
+          return {
+            chunks: vectorChunks,
+            mode: "vector",
+          };
+        }
       } catch (error) {
         console.error("RAG vector retrieval failed:", error.message);
       }
@@ -1003,16 +1208,23 @@ async function retrieveRagChunksForQuestion(options = {}) {
   }
 
   try {
-    return await searchRagChunksByKeywords({
+    const lexicalChunks = await searchRagChunksByKeywords({
       symbol,
       query: question,
       docIds,
       year,
       limit,
     });
+    return {
+      chunks: lexicalChunks,
+      mode: lexicalChunks.length > 0 ? "lexical" : "none",
+    };
   } catch (error) {
     console.error("RAG lexical retrieval failed:", error.message);
-    return [];
+    return {
+      chunks: [],
+      mode: "none",
+    };
   }
 }
 
@@ -1222,6 +1434,27 @@ function buildFollowUpQuestions({ companyName, year, quarter, topDocuments }) {
   return Array.from(new Set(suggested)).slice(0, 6);
 }
 
+function finalizeAnswer(answer, options = {}) {
+  let finalText = `${answer || ""}`.trim();
+  if (!finalText) {
+    return "";
+  }
+
+  const ragChunks = Array.isArray(options.ragChunks) ? options.ragChunks : [];
+  if (ragChunks.length > 0 && /no summary available/i.test(finalText)) {
+    finalText = finalText.replace(
+      /no summary available/gi,
+      "feed summary was missing, so extracted filing text was used instead"
+    );
+  }
+
+  if (!/not investment advice|not a buy\/sell recommendation|for research and learning/i.test(finalText)) {
+    finalText = `${finalText}\n\n${RESEARCH_ONLY_NOTE}`;
+  }
+
+  return finalText;
+}
+
 function normalizeCardLevel(value, fallback = 1) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -1238,7 +1471,11 @@ function buildContextLines(documents) {
   return documents.map((document, index) => {
     const quarterLine = document.quarter ? `Quarter: ${document.quarter}` : "Quarter: n/a";
     const yearLine = document.fiscal_year ? `Fiscal year: ${document.fiscal_year}` : "Fiscal year: n/a";
-    const summaryText = hasMeaningfulDescription(document) ? document.description : "No summary available.";
+    const summaryText = hasMeaningfulDescription(document)
+      ? document.description
+      : document.rag_excerpt
+        ? "Feed summary unavailable; extracted filing text is attached below."
+        : "Summary unavailable in feed metadata.";
     const ragLine = document.rag_excerpt
       ? `Extracted filing text: ${normalizeWhitespace(document.rag_excerpt).slice(0, 1000)}`
       : "";
@@ -1716,6 +1953,122 @@ async function requestChatCompletionWithFallback({
   throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY.");
 }
 
+function hasCitationReferences(text) {
+  return /\[(?:C|D)\d+\]/.test(`${text || ""}`);
+}
+
+function hasRequiredSummarySections(text) {
+  const lower = `${text || ""}`.toLowerCase();
+  return REQUIRED_SUMMARY_SECTION_HEADERS.every((header) => lower.includes(header.toLowerCase()));
+}
+
+function extractCitationIdsFromContext(lines) {
+  const joined = Array.isArray(lines) ? lines.join("\n") : "";
+  const matches = joined.match(/\[(?:C|D)\d+\]/g) || [];
+  return Array.from(new Set(matches));
+}
+
+async function enforceAnswerQualityWithRewrite({
+  answer,
+  question,
+  companyName,
+  symbol,
+  isSummaryRequest,
+  chunkLines,
+  contextLines,
+}) {
+  const requiresSummaryRepair = isSummaryRequest && !hasRequiredSummarySections(answer);
+  const requiresCitationRepair = !hasCitationReferences(answer);
+  if (!requiresSummaryRepair && !requiresCitationRepair) {
+    return {
+      text: answer,
+      repaired: false,
+    };
+  }
+
+  const availableChunkCitations = extractCitationIdsFromContext(chunkLines);
+  const availableDocCitations = extractCitationIdsFromContext(contextLines);
+  const availableCitationText = [...availableChunkCitations, ...availableDocCitations].join(", ") || "none";
+
+  const repairGoals = [];
+  if (requiresSummaryRepair) {
+    repairGoals.push("restore all mandatory summary sections in the exact required order");
+  }
+  if (requiresCitationRepair) {
+    repairGoals.push("add inline evidence citations to factual claims");
+  }
+
+  const repairSystemPrompt = [
+    "You are a strict quality editor for Groww AI responses.",
+    "Rewrite the draft answer using ONLY provided evidence.",
+    "Do not add unsupported claims or external facts.",
+    "Every factual claim must include an inline citation using available ids.",
+    "Prefer [C#] citations when chunk evidence exists; use [D#] for document-level fallback.",
+    "If evidence is missing, explicitly write: Not available in retrieved documents.",
+    "Keep language beginner-friendly and free from buy/sell advice.",
+    "Return plain text only.",
+  ].join("\n");
+
+  const repairUserPrompt = [
+    `Company: ${companyName || symbol}`,
+    `Symbol: ${symbol}`,
+    `Question: ${question}`,
+    `Quality goals: ${repairGoals.join("; ")}.`,
+    `Available citation ids: ${availableCitationText}`,
+    `Required summary section headers: ${REQUIRED_SUMMARY_SECTION_HEADERS.join(" | ")}`,
+    "",
+    "Draft answer:",
+    answer,
+    "",
+    "Retrieved chunk evidence:",
+    Array.isArray(chunkLines) && chunkLines.length > 0 ? chunkLines.join("\n\n") : "No chunk evidence.",
+    "",
+    "Retrieved document evidence:",
+    Array.isArray(contextLines) && contextLines.length > 0 ? contextLines.join("\n\n") : "No document evidence.",
+  ].join("\n");
+
+  try {
+    const repairedCompletion = await requestChatCompletionWithFallback({
+      systemPrompt: repairSystemPrompt,
+      history: [],
+      userPrompt: repairUserPrompt,
+      temperature: 0.1,
+    });
+    const repairedText = `${repairedCompletion.text || ""}`.trim();
+    if (!repairedText) {
+      return {
+        text: answer,
+        repaired: false,
+      };
+    }
+
+    if (requiresSummaryRepair && !hasRequiredSummarySections(repairedText)) {
+      return {
+        text: answer,
+        repaired: false,
+      };
+    }
+
+    if (requiresCitationRepair && !hasCitationReferences(repairedText)) {
+      return {
+        text: answer,
+        repaired: false,
+      };
+    }
+
+    return {
+      text: repairedText,
+      repaired: true,
+      modelUsed: repairedCompletion.modelUsed,
+    };
+  } catch {
+    return {
+      text: answer,
+      repaired: false,
+    };
+  }
+}
+
 async function answerWithGrok({ question, companyName, symbol, documents, history, isSummaryRequest, ragChunks }) {
   if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
     throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY on the backend.");
@@ -1727,29 +2080,49 @@ async function answerWithGrok({ question, companyName, symbol, documents, histor
 
   const contextLines = buildContextLines(documents);
   const chunkLines = buildChunkContextLines(Array.isArray(ragChunks) ? ragChunks : []);
+  const hasChunkEvidence = chunkLines.length > 0;
+  const citationProtocol = hasChunkEvidence
+    ? [
+        "Citation protocol:",
+        "- For factual claims, use [C#] citations from retrieved chunk evidence.",
+        "- Use [D#] only for fallback context or high-level framing.",
+        "- Do not invent citation ids.",
+        "- If evidence is missing, explicitly state: Not available in retrieved documents.",
+      ].join("\n")
+    : [
+        "Citation protocol:",
+        "- Use [D#] citations from retrieved document evidence for factual claims.",
+        "- Do not invent citation ids.",
+        "- If evidence is missing, explicitly state: Not available in retrieved documents.",
+      ].join("\n");
 
   const summaryInstruction = isSummaryRequest
     ? [
-        "When the user asks for a summary, you MUST use these sections in order:",
-        "1. Point-by-point deep analysis",
-        "2. Business model breakdown",
-        "3. Key financial metrics and what they indicate",
-        "4. Management commentary -> numbers -> long-term implications",
-        "5. Risks, red flags, and consistency checks",
-        "6. Which points/sections should absolutely be included",
-        "Inside each section, explicitly include:",
-        "- What details/interpretations add value",
-        "- What level of depth is useful vs unnecessary",
-        "- What usually gets ignored but should not be ignored",
-        "Use chunk citations like [C1], [C2] to support claims whenever chunk evidence is available.",
+        "When the user asks for a summary, use these exact section headers in order:",
+        ...REQUIRED_SUMMARY_SECTION_HEADERS,
+        "In each section include these three labeled bullets:",
+        "- Value-add details",
+        "- Helpful depth",
+        "- Often ignored but important",
+        "Each section must include at least one inline citation.",
+        "Where possible, distinguish reported facts vs inference in plain language.",
+        "Keep explanations beginner-friendly but analytically deep.",
       ].join("\n")
-    : "Answer in concise, beginner-friendly language and cite chunk references like [C1], [C2] (or [D1], [D2] if only document-level evidence exists).";
+    : [
+        "For normal Q&A, use this compact structure:",
+        "1) Direct answer",
+        "2) Evidence-backed explanation",
+        "3) What to monitor next",
+        "Use concise beginner-friendly language with depth where useful.",
+        "Every factual claim should carry an inline citation.",
+      ].join("\n");
 
   const systemPrompt = [
     "You are Groww AI for beginner investors.",
     "Use only the provided filing context.",
     "If data is missing, clearly say it is not available in retrieved documents.",
     "Do not provide buy/sell recommendations.",
+    citationProtocol,
     summaryInstruction,
   ].join("\n");
 
@@ -1772,17 +2145,28 @@ async function answerWithGrok({ question, companyName, symbol, documents, histor
     systemPrompt,
     history,
     userPrompt: questionPrompt,
-    temperature: 0.2,
+    temperature: isSummaryRequest ? 0.15 : 0.2,
   });
-  const parsed = completion.text;
+  const parsed = `${completion.text || ""}`.trim();
 
   if (!parsed) {
     throw new Error("LLM returned an empty answer.");
   }
 
-  return {
+  const qualityResult = await enforceAnswerQualityWithRewrite({
     answer: parsed,
-    modelUsed: completion.modelUsed,
+    question,
+    companyName,
+    symbol,
+    isSummaryRequest,
+    chunkLines,
+    contextLines,
+  });
+
+  return {
+    answer: qualityResult.text,
+    modelUsed: qualityResult.modelUsed || completion.modelUsed,
+    quality_repair_applied: Boolean(qualityResult.repaired),
   };
 }
 
@@ -1809,9 +2193,12 @@ async function generateSummaryCardsWithGrok({
     "You are Groww AI card composer for beginners.",
     "Return strict JSON only. Do not include markdown or extra prose.",
     "Use only provided filing context.",
-    "If swipe direction is right: go deeper with more evidence from the report context.",
-    "If swipe direction is left: explain from an alternative perspective to improve understanding.",
     "Each card must include: concept, title, explanation, why_it_matters, example, level, source_refs.",
+    "Cards must be evidence-grounded and beginner-friendly.",
+    "When evidence is weak, say what is not available instead of guessing.",
+    "If swipe direction is right: increase depth and specificity, include tighter evidence links from filings.",
+    "If swipe direction is left: keep core meaning but switch to simpler alternate framing (analogy, decomposition, or contrast).",
+    "For right swipe, level should not decrease. For left swipe, keep level same or reduce by 1 if needed for clarity.",
     "source_refs should be an array of objects with title and optional url/source_name.",
   ].join("\n");
 
@@ -1822,6 +2209,8 @@ async function generateSummaryCardsWithGrok({
           `Symbol: ${symbol}`,
           "Task: Create 3 progressive summary cards (level 1 -> 3).",
           "Tone: plain language, high clarity, no investment advice.",
+          "Each card should focus on a distinct concept (no repetition).",
+          "Each card should reference evidence through source_refs.",
           "Output JSON shape: {\"cards\":[{...},{...},{...}]}",
           "Context:",
           contextLines,
@@ -1832,8 +2221,8 @@ async function generateSummaryCardsWithGrok({
           `Current card: ${JSON.stringify(currentCard)}`,
           `Swipe direction: ${swipeDirection}`,
           swipeDirection === "right"
-            ? "Task: Generate exactly 1 deeper follow-up card (higher level) with tighter report-grounded evidence."
-            : "Task: Generate exactly 1 alternative-perspective card (different framing) to improve understanding.",
+            ? "Task: Generate exactly 1 deeper follow-up card with tighter report-grounded evidence and concrete implications."
+            : "Task: Generate exactly 1 alternative-perspective card (different framing) that is easier to grasp without losing factual rigor.",
           "Output JSON shape: {\"cards\":[{...}]}",
           "Context:",
           contextLines,
@@ -1898,11 +2287,139 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/auth/request-otp", (req, res) => {
+  cleanupExpiredAuthOtps();
+
+  const channel = normalizeAuthChannel(req.body.channel);
+  const identifier = normalizeAuthIdentifier(channel, req.body.identifier);
+  if (!channel) {
+    res.status(400).json({ error: "'channel' must be 'mobile' or 'email'." });
+    return;
+  }
+
+  if (!isValidAuthIdentifier(channel, identifier)) {
+    res.status(400).json({
+      error: channel === "mobile" ? "Enter a valid mobile number." : "Enter a valid email address.",
+    });
+    return;
+  }
+
+  const storeKey = buildOtpStoreKey(channel, identifier);
+  const existing = authOtpStore.get(storeKey);
+  const now = Date.now();
+  if (existing && now - existing.lastSentAt < AUTH_OTP_RESEND_COOLDOWN_MS) {
+    const waitSeconds = Math.ceil((AUTH_OTP_RESEND_COOLDOWN_MS - (now - existing.lastSentAt)) / 1000);
+    res.status(429).json({ error: `Please wait ${waitSeconds}s before requesting another OTP.` });
+    return;
+  }
+
+  const otp = createOtpCode();
+  const expiresAt = now + AUTH_OTP_TTL_MS;
+  authOtpStore.set(storeKey, {
+    otp,
+    expiresAt,
+    attempts: 0,
+    channel,
+    identifier,
+    lastSentAt: now,
+  });
+
+  const payload = {
+    ok: true,
+    channel,
+    masked_identifier: maskAuthIdentifier(channel, identifier),
+    expires_in_sec: Math.round(AUTH_OTP_TTL_MS / 1000),
+    delivery_mode: AUTH_OTP_MODE,
+    message:
+      AUTH_OTP_MODE === "demo"
+        ? "Demo OTP generated. Use the code shown below."
+        : "OTP generated. Integrate SMS/email provider for delivery.",
+  };
+
+  if (AUTH_OTP_MODE === "demo") {
+    payload.demo_otp = otp;
+  }
+
+  res.json(payload);
+});
+
+app.post("/api/auth/verify-otp", (req, res) => {
+  cleanupExpiredAuthOtps();
+
+  const channel = normalizeAuthChannel(req.body.channel);
+  const identifier = normalizeAuthIdentifier(channel, req.body.identifier);
+  const otp = `${req.body.otp || ""}`.trim();
+
+  if (!channel) {
+    res.status(400).json({ error: "'channel' must be 'mobile' or 'email'." });
+    return;
+  }
+
+  if (!isValidAuthIdentifier(channel, identifier)) {
+    res.status(400).json({
+      error: channel === "mobile" ? "Enter a valid mobile number." : "Enter a valid email address.",
+    });
+    return;
+  }
+
+  if (!/^\d{6}$/.test(otp)) {
+    res.status(400).json({ error: "Enter a valid 6-digit OTP." });
+    return;
+  }
+
+  const storeKey = buildOtpStoreKey(channel, identifier);
+  const stored = authOtpStore.get(storeKey);
+  if (!stored) {
+    res.status(400).json({ error: "OTP not found or expired. Request a new OTP." });
+    return;
+  }
+
+  if (stored.expiresAt <= Date.now()) {
+    authOtpStore.delete(storeKey);
+    res.status(400).json({ error: "OTP expired. Request a new OTP." });
+    return;
+  }
+
+  if (stored.otp !== otp) {
+    const nextAttempts = Number(stored.attempts || 0) + 1;
+    stored.attempts = nextAttempts;
+    authOtpStore.set(storeKey, stored);
+    if (nextAttempts >= AUTH_OTP_MAX_ATTEMPTS) {
+      authOtpStore.delete(storeKey);
+      res.status(400).json({ error: "Too many failed attempts. Request a new OTP." });
+      return;
+    }
+    res.status(400).json({ error: "Invalid OTP. Please try again." });
+    return;
+  }
+
+  authOtpStore.delete(storeKey);
+  const token = randomUUID();
+  const session = {
+    token,
+    channel,
+    identifier,
+    verified_at: new Date().toISOString(),
+  };
+  authSessionStore.set(token, session);
+
+  res.json({
+    ok: true,
+    token,
+    user: {
+      channel,
+      identifier,
+      masked_identifier: maskAuthIdentifier(channel, identifier),
+    },
+    verified_at: session.verified_at,
+  });
+});
+
 app.get("/api/companies", async (req, res) => {
   try {
     const query = `${req.query.query || ""}`.trim().toLowerCase();
     const requestedLimit = Number(req.query.limit);
-    const defaultLimit = query.length > 0 ? 200 : 6000;
+    const defaultLimit = query.length > 0 ? 1200 : 25000;
     const limit = Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit;
     if (!hasMasterDatabase()) {
       res.status(500).json({
@@ -1937,7 +2454,7 @@ app.get("/api/documents", async (req, res) => {
     const to = `${req.query.to || ""}`.trim();
     const sort = `${req.query.sort || "newest"}`.trim();
     const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.max(1, Number(req.query.page_size || 10));
+    const pageSize = Math.max(1, Math.min(Number(req.query.page_size || 10), 250));
 
     if (!symbol) {
       res.status(400).json({ error: "'symbol' query param is required." });
@@ -2037,6 +2554,29 @@ app.post("/api/rag/ingest", async (req, res) => {
   }
 });
 
+app.get("/api/rag/status", async (req, res) => {
+  try {
+    const symbol = `${req.query.symbol || ""}`.trim().toUpperCase();
+    if (!symbol) {
+      res.status(400).json({ error: "'symbol' query param is required." });
+      return;
+    }
+
+    if (!hasRagDatabase()) {
+      res.status(400).json({ error: "RAG database is unavailable. Set DATABASE_URL first." });
+      return;
+    }
+
+    const stats = await getRagStatsBySymbol(symbol);
+    res.json({
+      ...stats,
+      rag_ready: stats.chunk_count > 0,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch RAG status." });
+  }
+});
+
 app.post("/api/chat", async (req, res) => {
   try {
     const mode = `${req.body.mode || "chat"}`.trim().toLowerCase();
@@ -2079,13 +2619,7 @@ app.post("/api/chat", async (req, res) => {
       res.status(400).json({ error: "'question' is required." });
       return;
     }
-
-    if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
-      res.status(500).json({
-        error: "LLM is not configured. Add OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY in backend environment variables.",
-      });
-      return;
-    }
+    const llmAvailable = HAS_OLLAMA_CHAT || HAS_GEMINI_CHAT || HAS_XAI_CHAT;
 
     const rawItems = await loadRawDocuments(symbol);
     const normalized = rawItems
@@ -2116,6 +2650,8 @@ app.post("/api/chat", async (req, res) => {
           meta: {
             model_used: getDefaultModelUsed(),
             retrieved_documents: 0,
+            retrieved_chunks: 0,
+            retrieval_mode: "none",
             doc_scope_requested: docIds.length > 0,
           },
         });
@@ -2155,6 +2691,8 @@ app.post("/api/chat", async (req, res) => {
         meta: {
           model_used: getDefaultModelUsed(),
           retrieved_documents: 0,
+          retrieved_chunks: 0,
+          retrieval_mode: "none",
           doc_scope_requested: docIds.length > 0,
           swipe_direction: swipeDirection,
         },
@@ -2192,13 +2730,15 @@ app.post("/api/chat", async (req, res) => {
           ? `${currentCard?.title || ""} ${currentCard?.concept || ""}`.trim() || "deeper filing understanding"
           : "business model metrics management commentary risks";
 
-    const ragChunks = await retrieveRagChunksForQuestion({
+    const ragResult = await retrieveRagChunksForQuestion({
       symbol,
       question: retrievalQuestion,
       docIds: enrichedContextDocuments.map((document) => document.id),
       year,
       limit: RAG_RETRIEVAL_LIMIT,
     });
+    const ragChunks = ragResult.chunks;
+    const retrievalMode = ragResult.mode;
 
     const chunkSources = buildChunkSources(ragChunks, 8);
     const fallbackSources = uniqueSources(enrichedContextDocuments, 8);
@@ -2210,6 +2750,27 @@ app.post("/api/chat", async (req, res) => {
     const finalCompanyName = companyName || enrichedContextDocuments[0]?.company_name || symbol;
 
     if (mode === "summary_cards_init") {
+      if (!llmAvailable) {
+        res.json({
+          cards: buildFallbackSummaryCardsInit({
+            companyName: finalCompanyName,
+            symbol,
+            documents: enrichedContextDocuments,
+          }),
+          sources: blendedSources,
+          meta: {
+            model_used: "fallback:rule-based",
+            retrieved_documents: contextDocuments.length,
+            enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
+            retrieved_chunks: ragChunks.length,
+            retrieval_mode: retrievalMode,
+            ...confidenceMeta,
+            doc_scope_requested: docIds.length > 0,
+          },
+        });
+        return;
+      }
+
       try {
         const generated = await generateSummaryCardsWithGrok({
           mode,
@@ -2227,6 +2788,7 @@ app.post("/api/chat", async (req, res) => {
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             retrieved_chunks: ragChunks.length,
+            retrieval_mode: retrievalMode,
             ...confidenceMeta,
             doc_scope_requested: docIds.length > 0,
           },
@@ -2264,6 +2826,30 @@ app.post("/api/chat", async (req, res) => {
         return;
       }
 
+      if (!llmAvailable) {
+        res.json({
+          cards: [
+            buildFallbackNextSummaryCard({
+              swipeDirection,
+              currentCard: currentCardPayload,
+              documents: enrichedContextDocuments,
+            }),
+          ],
+          sources: blendedSources,
+          meta: {
+            model_used: "fallback:rule-based",
+            retrieved_documents: contextDocuments.length,
+            enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
+            retrieved_chunks: ragChunks.length,
+            retrieval_mode: retrievalMode,
+            ...confidenceMeta,
+            doc_scope_requested: docIds.length > 0,
+            swipe_direction: swipeDirection,
+          },
+        });
+        return;
+      }
+
       try {
         const generated = await generateSummaryCardsWithGrok({
           mode,
@@ -2283,6 +2869,7 @@ app.post("/api/chat", async (req, res) => {
             retrieved_documents: contextDocuments.length,
             enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
             retrieved_chunks: ragChunks.length,
+            retrieval_mode: retrievalMode,
             ...confidenceMeta,
             doc_scope_requested: docIds.length > 0,
             swipe_direction: swipeDirection,
@@ -2301,6 +2888,8 @@ app.post("/api/chat", async (req, res) => {
 
     let answer;
     let answerModelUsed = getDefaultModelUsed();
+    let qualityRepairApplied = false;
+    let llmErrorMessage = "";
     try {
       const llmAnswer = await answerWithGrok({
         question,
@@ -2313,14 +2902,26 @@ app.post("/api/chat", async (req, res) => {
       });
       answer = llmAnswer.answer;
       answerModelUsed = llmAnswer.modelUsed;
+      qualityRepairApplied = Boolean(llmAnswer.quality_repair_applied);
     } catch (error) {
-      res.status(502).json({
-        error:
-          error instanceof Error
-            ? error.message
-            : "LLM request failed while answering this query.",
-      });
-      return;
+      llmErrorMessage = error instanceof Error ? error.message : "LLM request failed while answering this query.";
+      console.error(`LLM answer generation failed for ${symbol}:`, llmErrorMessage);
+      answer = isSummaryRequest
+        ? buildSummaryAnswer({
+            companyName: finalCompanyName,
+            symbol,
+            documents: enrichedContextDocuments,
+            year,
+            quarter,
+          })
+        : buildDefaultAnswer({
+            companyName: finalCompanyName,
+            symbol,
+            question,
+            documents: enrichedContextDocuments,
+          });
+      answerModelUsed = "fallback:rule-based";
+      qualityRepairApplied = false;
     }
 
     if (!answer) {
@@ -2340,6 +2941,8 @@ app.post("/api/chat", async (req, res) => {
           });
     }
 
+    answer = finalizeAnswer(answer, { ragChunks });
+
     const sources = blendedSources;
     const followUpQuestions = buildFollowUpQuestions({
       companyName: finalCompanyName,
@@ -2357,6 +2960,9 @@ app.post("/api/chat", async (req, res) => {
         retrieved_documents: enrichedContextDocuments.length,
         enriched_documents: enrichedContextDocuments.filter((document) => Boolean(document.rag_excerpt)).length,
         retrieved_chunks: ragChunks.length,
+        retrieval_mode: retrievalMode,
+        quality_repair_applied: qualityRepairApplied,
+        ...(llmErrorMessage ? { llm_error: llmErrorMessage.slice(0, 260) } : {}),
         ...confidenceMeta,
         doc_scope_requested: docIds.length > 0,
       },

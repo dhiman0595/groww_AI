@@ -65,28 +65,31 @@ export async function fetchChatAnswer(payload: ChatRequest): Promise<ChatRespons
   });
 
   if (!response.ok) {
-    let message = "Failed to fetch chat answer from API.";
+    const defaultMessage = "Failed to fetch chat answer from API.";
+    let message = defaultMessage;
+    let hasBackendError = false;
 
     try {
       const payload = (await response.json()) as { error?: string };
       if (payload?.error) {
         message = payload.error;
+        hasBackendError = true;
       }
     } catch {
       // Uses default message when API response body is unavailable.
     }
 
-    if (response.status === 404 && !API_BASE_URL) {
+    if (response.status === 404 && !API_BASE_URL && !hasBackendError) {
       message =
         "Chat API not found on this domain. Ensure /api/chat is deployed and reachable from the same app URL.";
     }
 
-    if (response.status >= 500 && !API_BASE_URL) {
+    if (response.status >= 500 && !API_BASE_URL && !hasBackendError) {
       message =
         `Backend is unavailable (status ${response.status}). Check server logs and environment variables (OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY, DATABASE_URL).`;
     }
 
-    if (message === "Failed to fetch chat answer from API.") {
+    if (message === defaultMessage) {
       message = `Chat request failed with status ${response.status}.`;
     }
 

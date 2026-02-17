@@ -442,6 +442,49 @@ async function searchRagChunksByKeywords(options = {}) {
   });
 }
 
+async function getRagStatsBySymbol(symbol) {
+  const normalizedSymbol = `${symbol || ""}`.trim().toUpperCase();
+  if (!normalizedSymbol) {
+    return {
+      symbol: "",
+      chunk_count: 0,
+      doc_count: 0,
+      last_indexed_at: "",
+    };
+  }
+
+  const isReady = await ensureRagSchema();
+  if (!isReady) {
+    return {
+      symbol: normalizedSymbol,
+      chunk_count: 0,
+      doc_count: 0,
+      last_indexed_at: "",
+    };
+  }
+
+  const pool = createPool();
+  const { rows } = await pool.query(
+    `
+      SELECT
+        COUNT(*)::int AS chunk_count,
+        COUNT(DISTINCT doc_id)::int AS doc_count,
+        MAX(updated_at) AS last_indexed_at
+      FROM filing_rag_chunks
+      WHERE symbol = $1;
+    `,
+    [normalizedSymbol]
+  );
+
+  const row = rows[0] || {};
+  return {
+    symbol: normalizedSymbol,
+    chunk_count: Number(row.chunk_count) || 0,
+    doc_count: Number(row.doc_count) || 0,
+    last_indexed_at: row.last_indexed_at ? new Date(row.last_indexed_at).toISOString() : "",
+  };
+}
+
 module.exports = {
   RAG_EMBEDDING_DIM,
   hasRagDatabase,
@@ -451,4 +494,5 @@ module.exports = {
   upsertRagChunks,
   searchRagChunks,
   searchRagChunksByKeywords,
+  getRagStatsBySymbol,
 };

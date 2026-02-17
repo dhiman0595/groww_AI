@@ -59,16 +59,27 @@ function filterCompaniesByQuery(companies: CompanyOption[], query?: string): Com
   });
 }
 
-export async function fetchCompanies(query?: string): Promise<CompanyOption[]> {
+export async function fetchCompanies(
+  query?: string,
+  signal?: AbortSignal,
+  limitOverride?: number
+): Promise<CompanyOption[]> {
   if (isMockMode()) {
     const documents = normalizeRawDocuments(getMockRawItems());
-    return filterCompaniesByQuery(deriveCompaniesFromDocuments(documents), query);
+    const filtered = filterCompaniesByQuery(deriveCompaniesFromDocuments(documents), query);
+    if (Number.isFinite(limitOverride)) {
+      return filtered.slice(0, Math.max(1, Math.floor(Number(limitOverride))));
+    }
+    return filtered;
   }
 
   const normalizedQuery = query?.trim();
-  const limit = normalizedQuery ? 200 : 6000;
-  const endpoint = withBaseUrl(`/api/companies${toQueryString({ query: normalizedQuery, limit })}`);
-  const response = await fetch(endpoint);
+  const dynamicLimit = normalizedQuery ? 1200 : 25000;
+  const requestedLimit = Number.isFinite(limitOverride)
+    ? Math.max(1, Math.min(Math.floor(Number(limitOverride)), dynamicLimit))
+    : dynamicLimit;
+  const endpoint = withBaseUrl(`/api/companies${toQueryString({ query: normalizedQuery, limit: requestedLimit })}`);
+  const response = await fetch(endpoint, { signal });
 
   if (!response.ok) {
     let message = "Failed to load companies from API.";
@@ -84,7 +95,11 @@ export async function fetchCompanies(query?: string): Promise<CompanyOption[]> {
   }
 
   const payload = (await response.json()) as RawCompaniesResponse;
-  return filterCompaniesByQuery(payload.companies, query);
+  const filtered = filterCompaniesByQuery(payload.companies, query);
+  if (Number.isFinite(limitOverride)) {
+    return filtered.slice(0, Math.max(1, Math.floor(Number(limitOverride))));
+  }
+  return filtered;
 }
 
 export async function fetchDocuments(params: DocumentsQueryParams): Promise<DocumentsResponse> {

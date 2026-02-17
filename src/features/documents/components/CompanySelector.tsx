@@ -50,7 +50,16 @@ export function CompanySelector({
           aria-autocomplete="list"
           value={searchText}
           placeholder="Search by name or symbol"
-          onFocus={() => setOpen(true)}
+          onFocus={() => {
+            setOpen(true);
+            if (
+              selectedCompany &&
+              searchText.trim().toLowerCase() === selectedCompany.company_name.trim().toLowerCase()
+            ) {
+              onSearchTextChange("");
+              setHighlightedIndex(0);
+            }
+          }}
           onChange={(event) => {
             onSearchTextChange(event.target.value);
             setOpen(true);
@@ -58,6 +67,9 @@ export function CompanySelector({
           }}
           onBlur={() => {
             window.setTimeout(() => setOpen(false), 100);
+            if (selectedCompany && searchText.trim().length === 0) {
+              onSearchTextChange(selectedCompany.company_name);
+            }
           }}
           onKeyDown={(event) => {
             if (!open || companies.length === 0) {
@@ -89,8 +101,13 @@ export function CompanySelector({
           <div
             id="company-search-listbox"
             role="listbox"
-            className="absolute z-20 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-slate-200 bg-white shadow-lg"
+            className="absolute z-20 mt-1 max-h-[60vh] w-full overflow-y-auto rounded-md border border-slate-200 bg-white shadow-lg"
           >
+            {!isLoading && companies.length > 0 ? (
+              <p className="border-b border-slate-100 px-3 py-1.5 text-[11px] text-slate-500">
+                {companies.length.toLocaleString("en-IN")} companies
+              </p>
+            ) : null}
             {isLoading ? <p className="px-3 py-2 text-xs text-slate-500">Searching companies...</p> : null}
             {!isLoading && companies.length === 0 ? (
               <p className="px-3 py-2 text-xs text-slate-500">No matching companies found.</p>

@@ -1,110 +1,80 @@
-# React + TypeScript + Vite
+# Groww AI - Filing Research Assistant
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Beginner-friendly stock filing analysis app with:
+- mobile/email OTP onboarding flow
+- guest mode with restricted company access (3 companies)
+- company master dropdown from ISIN mapping (Neon/Postgres)
+- real filing feed ingestion (StockInsights API)
+- chat + RAG grounded answers
+- AI summary battle cards with swipe progression
+- LLM fallback chain: `Ollama -> Gemini -> xAI`
 
-Currently, two official plugins are available:
+## Local Run
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Backend API server:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run server
 ```
 
-## Companies Master Import (Neon/Postgres)
+## Required Environment Variables
 
-The company dropdown can be powered from a `companies_master` table in Postgres.
+Copy `.env.example` and set values:
 
-1. Set `DATABASE_URL` in your environment.
-2. Run:
+```bash
+VITE_DOCS_MODE=real
+VITE_API_BASE_URL=http://localhost:8787
+
+DATABASE_URL=postgresql://...
+
+STOCKINSIGHTS_API_KEY=...
+STOCKINSIGHTS_API_URL=https://stockinsights-ai-main-95a26a0.zuplo.app/api/in/v0/documents
+STOCKINSIGHTS_COMPANY_PARAM=ticker
+
+# LLM fallback order
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=...
+OLLAMA_EMBEDDING_MODEL=...
+
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_EMBEDDING_MODEL=text-embedding-004
+
+XAI_API_KEY=...
+XAI_MODEL=grok-3-mini
+XAI_EMBEDDING_MODEL=...
+
+AUTH_OTP_MODE=demo
+AUTH_OTP_TTL_MS=300000
+AUTH_OTP_MAX_ATTEMPTS=5
+```
+
+## Import Company Master (ISIN Mapping)
 
 ```bash
 npm run import:companies -- /absolute/path/to/ISIN_mapping.json --replace
 ```
 
-This creates/updates `companies_master` and `/api/companies` will use this table as the primary source.
+This populates `companies_master`, used by `/api/companies`.
 
-## Filings Feed API (Zuplo)
+## API Endpoints
 
-Configure backend environment variables to fetch real filings per selected company:
+- `GET /api/health`
+- `POST /api/auth/request-otp`
+- `POST /api/auth/verify-otp`
+- `GET /api/companies?query=&limit=`
+- `GET /api/documents?symbol=...&doc_type=...`
+- `POST /api/chat`
+- `POST /api/rag/ingest`
+- `GET /api/rag/status?symbol=...`
 
-```bash
-STOCKINSIGHTS_API_KEY=<your_api_key>
-STOCKINSIGHTS_API_URL=https://stockinsights-ai-main-95a26a0.zuplo.app/api/in/v0/documents
-STOCKINSIGHTS_COMPANY_PARAM=ticker
-```
+## Notes
 
-The frontend document-type dropdown passes the selected type and backend calls this API using `document_type`.
-
-### Troubleshooting company dropdown
-
-If you still see only a small hardcoded set of companies, check:
-
-1. `VITE_DOCS_MODE=real` in frontend env.
-2. `DATABASE_URL` is set on backend.
-3. `companies_master` has been imported (`npm run import:companies -- <path-to-ISIN_mapping.json> --replace`).
-
-### Company list size
-
-`/api/companies` now returns a large master list when search is empty (default limit 6000), so the dropdown can scroll through the full imported mapping list.
+- Date normalization drops invalid epoch-like values (for example `1970`) from filing metadata.
+- PDF extraction uses `pdf-parse` v2 API with backward compatibility fallback.
+- All chat responses include a research-only caution and avoid buy/sell advice phrasing.
