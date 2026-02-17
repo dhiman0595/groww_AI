@@ -1,9 +1,6 @@
 const { z } = require("zod");
 const { FLASHCARD_TAGS, FLASHCARD_DOC_TYPE } = require("../../../shared/aiFlashcards.cjs");
 
-const CARD_ID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
 const isoDateString = z
   .string()
   .trim()
@@ -12,16 +9,29 @@ const isoDateString = z
 
 const flashcardTagSchema = z.enum(FLASHCARD_TAGS);
 
-const flashcardEvidenceSchema = z.array(z.string().trim().min(8).max(320)).min(2).max(6);
+const sourceRefSchema = z
+  .string()
+  .trim()
+  .regex(/^p\d{1,4}$/i, "source_ref must be in format p<number>.");
+
+const flashcardEvidenceItemSchema = z
+  .object({
+    type: z.enum(["metric", "quote"]),
+    text: z.string().trim().min(8).max(320),
+    source_ref: sourceRefSchema,
+  })
+  .strict();
+
+const flashcardEvidenceSchema = z.array(flashcardEvidenceItemSchema).min(2).max(6);
 
 const flashcardSchema = z
   .object({
-    id: z.string().trim().regex(CARD_ID_REGEX, "Card id must be a UUID."),
+    id: z.string().trim().min(1).max(160),
     title: z.string().trim().min(6).max(90),
     tag: flashcardTagSchema,
     summary: z.string().trim().min(24).max(850),
     evidence: flashcardEvidenceSchema,
-    implication: z.string().trim().min(12).max(420),
+    why_it_matters: z.string().trim().min(12).max(420),
     confidence: z.number().min(0).max(1),
   })
   .strict();
@@ -36,7 +46,7 @@ const flashcardsResponseSchema = z
         generated_at: isoDateString,
       })
       .strict(),
-    cards: z.array(flashcardSchema).min(1).max(20),
+    cards: z.array(flashcardSchema).min(8).max(12),
   })
   .strict();
 
@@ -53,7 +63,7 @@ const flashcardsRequestSchema = z
       .strict()
       .optional(),
     externalSummaryText: z.string().trim().max(20000).optional(),
-    maxCards: z.number().int().min(8).max(14).default(12),
+    maxCards: z.number().int().min(8).max(12).default(12),
   })
   .strict();
 
@@ -66,8 +76,8 @@ function parseFlashcardsResponse(payload) {
 }
 
 module.exports = {
-  CARD_ID_REGEX,
   flashcardSchema,
+  flashcardEvidenceItemSchema,
   flashcardsRequestSchema,
   flashcardsResponseSchema,
   parseFlashcardsRequest,

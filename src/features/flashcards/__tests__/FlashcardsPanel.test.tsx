@@ -56,10 +56,18 @@ describe("FlashcardsPanel", () => {
           tag: "Financials",
           summary: "Management highlighted growth across major lines with controlled costs.",
           evidence: [
-            "CEO said revenue growth remained broad-based for the quarter.",
-            "CFO linked margin progress to operating efficiency.",
+            {
+              type: "quote",
+              text: "CEO said revenue growth remained broad-based for the quarter.",
+              source_ref: "p2",
+            },
+            {
+              type: "quote",
+              text: "CFO linked margin progress to operating efficiency.",
+              source_ref: "p3",
+            },
           ],
-          implication: "Execution quality is critical to preserve growth with margin discipline.",
+          why_it_matters: "Execution quality is critical to preserve growth with margin discipline.",
           confidence: 0.88,
         },
         {
@@ -68,10 +76,18 @@ describe("FlashcardsPanel", () => {
           tag: "Strategy",
           summary: "Management indicated expansion will continue but with selective market prioritization.",
           evidence: [
-            "Leadership said expansion follows CAC and payback filters.",
-            "Commentary stressed quality cohorts over tactical discounting.",
+            {
+              type: "quote",
+              text: "Leadership said expansion follows CAC and payback filters.",
+              source_ref: "p4",
+            },
+            {
+              type: "quote",
+              text: "Commentary stressed quality cohorts over tactical discounting.",
+              source_ref: "p5",
+            },
           ],
-          implication: "Growth can continue without fully sacrificing unit economics.",
+          why_it_matters: "Growth can continue without fully sacrificing unit economics.",
           confidence: 0.79,
         },
       ],
@@ -111,10 +127,18 @@ describe("FlashcardsPanel", () => {
           tag: "Risk",
           summary: "Management flagged near-term volatility in acquisition efficiency.",
           evidence: [
-            "CFO warned about short-term CAC volatility in specific cohorts.",
-            "Leadership said margin can fluctuate due to competitive campaigns.",
+            {
+              type: "quote",
+              text: "CFO warned about short-term CAC volatility in specific cohorts.",
+              source_ref: "p6",
+            },
+            {
+              type: "quote",
+              text: "Leadership said margin can fluctuate due to competitive campaigns.",
+              source_ref: "p7",
+            },
           ],
-          implication: "Quarterly earnings quality can vary while acquisition dynamics normalize.",
+          why_it_matters: "Quarterly earnings quality can vary while acquisition dynamics normalize.",
           confidence: 0.67,
         },
         {
@@ -123,10 +147,18 @@ describe("FlashcardsPanel", () => {
           tag: "Financials",
           summary: "Cost execution and revenue mix supported better contribution outcomes.",
           evidence: [
-            "CFO noted margin expansion from cost optimization.",
-            "Management connected operating leverage with stable demand pockets.",
+            {
+              type: "quote",
+              text: "CFO noted margin expansion from cost optimization.",
+              source_ref: "p8",
+            },
+            {
+              type: "quote",
+              text: "Management connected operating leverage with stable demand pockets.",
+              source_ref: "p9",
+            },
           ],
-          implication: "Disciplined execution can protect margin even during growth investment cycles.",
+          why_it_matters: "Disciplined execution can protect margin even during growth investment cycles.",
           confidence: 0.9,
         },
       ],

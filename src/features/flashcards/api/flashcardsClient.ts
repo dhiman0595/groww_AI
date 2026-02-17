@@ -1,5 +1,6 @@
 import type {
   AiFlashcard,
+  AiFlashcardEvidence,
   AiFlashcardsRequest,
   AiFlashcardsResponse,
   FlashcardTag,
@@ -7,12 +8,12 @@ import type {
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 const ALLOWED_TAGS: FlashcardTag[] = [
-  "Strategy",
   "Financials",
   "Product",
+  "Strategy",
+  "Operations",
   "Risk",
   "Regulation",
-  "Operations",
   "Guidance",
 ];
 
@@ -37,9 +38,28 @@ function normalizeCard(card: unknown): AiFlashcard | null {
   const value = card as Record<string, unknown>;
   const tag = typeof value.tag === "string" && ALLOWED_TAGS.includes(value.tag as FlashcardTag) ? (value.tag as FlashcardTag) : "Operations";
   const evidence = Array.isArray(value.evidence)
-    ? value.evidence.filter((line): line is string => typeof line === "string" && line.trim().length > 0).slice(0, 6)
+    ? value.evidence
+        .map((item): AiFlashcardEvidence | null => {
+          if (!item || typeof item !== "object") {
+            return null;
+          }
+          const entry = item as Record<string, unknown>;
+          const type = entry.type === "metric" || entry.type === "quote" ? entry.type : null;
+          const text = typeof entry.text === "string" ? entry.text.trim() : "";
+          const sourceRefRaw = typeof entry.source_ref === "string" ? entry.source_ref.trim().toLowerCase() : "";
+          if (!type || text.length < 8 || !/^p\d{1,4}$/.test(sourceRefRaw)) {
+            return null;
+          }
+          return {
+            type,
+            text: text.slice(0, 320),
+            source_ref: sourceRefRaw,
+          };
+        })
+        .filter((item): item is AiFlashcardEvidence => Boolean(item))
+        .slice(0, 6)
     : [];
-  if (evidence.length < 2) {
+  if (evidence.length < 2 || !Array.isArray(evidence)) {
     return null;
   }
 
@@ -48,8 +68,8 @@ function normalizeCard(card: unknown): AiFlashcard | null {
 
   const title = typeof value.title === "string" ? value.title.trim() : "";
   const summary = typeof value.summary === "string" ? value.summary.trim() : "";
-  const implication = typeof value.implication === "string" ? value.implication.trim() : "";
-  if (!title || !summary || !implication) {
+  const whyItMatters = typeof value.why_it_matters === "string" ? value.why_it_matters.trim() : "";
+  if (!title || !summary || !whyItMatters) {
     return null;
   }
 
@@ -58,8 +78,8 @@ function normalizeCard(card: unknown): AiFlashcard | null {
     title: title.slice(0, 90),
     tag,
     summary,
-    evidence: evidence as [string, ...string[]],
-    implication,
+    evidence: evidence as [AiFlashcardEvidence, ...AiFlashcardEvidence[]],
+    why_it_matters: whyItMatters,
     confidence,
   };
 }
@@ -155,7 +175,7 @@ export async function generateAiFlashcards(payload: AiFlashcardsRequest, signal?
 }
 
 export function toShareableFlashcardText(card: AiFlashcard): string {
-  const evidence = card.evidence.map((line) => `- ${line}`).join("\n");
+  const evidence = card.evidence.map((item) => `- [${item.source_ref}] (${item.type}) ${item.text}`).join("\n");
   return [
     `${card.title} (${card.tag})`,
     "",
@@ -164,7 +184,7 @@ export function toShareableFlashcardText(card: AiFlashcard): string {
     "Evidence:",
     evidence,
     "",
-    `Why it matters: ${card.implication}`,
+    `Why it matters: ${card.why_it_matters}`,
     "",
     `Confidence: ${(card.confidence * 100).toFixed(0)}%`,
   ].join("\n");

@@ -30,13 +30,21 @@ describe("flashcards API integration", () => {
           cards: Array.from({ length: 8 }, (_, index) => ({
             id: crypto.randomUUID(),
             title: `Theme ${index + 1} update`,
-            tag: "Strategy",
+            tag: index < 3 ? "Financials" : index < 5 ? "Strategy" : "Risk",
             summary: "Management discussed growth discipline and execution priorities for the quarter.",
             evidence: [
-              "Management linked growth investment to CAC/LTV discipline.",
-              "Commentary indicated profitability remains secondary to expansion in near term.",
+              {
+                type: "quote",
+                text: "Management linked growth investment to CAC/LTV discipline.",
+                source_ref: `p${index + 1}`,
+              },
+              {
+                type: "quote",
+                text: "Commentary indicated profitability remains secondary to expansion in near term.",
+                source_ref: `p${index + 2}`,
+              },
             ],
-            implication: "Execution consistency will determine whether growth remains quality-led.",
+            why_it_matters: "Execution consistency will determine whether growth remains quality-led.",
             confidence: 0.8,
           })),
         }),
@@ -74,19 +82,27 @@ describe("flashcards API integration", () => {
             generated_at: new Date().toISOString(),
           },
           cards: [
-            {
+            ...Array.from({ length: 8 }, (_, index) => ({
               id: crypto.randomUUID(),
-              title: "Revenue growth stayed broad-based",
-              tag: "Financials",
+              title: `Revenue growth stayed broad-based ${index + 1}`,
+              tag: index < 3 ? "Financials" : index < 5 ? "Product" : "Guidance",
               summary:
                 "Management reported growth across major lines with controlled operating costs. Commentary emphasized execution discipline over headline expansion alone.",
               evidence: [
-                "Revenue growth was described as broad-based across key offerings.",
-                "Management linked margin outcomes to fulfillment and marketing efficiency.",
+                {
+                  type: "metric",
+                  text: "Revenue growth was described as broad-based across key offerings.",
+                  source_ref: `p${index + 1}`,
+                },
+                {
+                  type: "quote",
+                  text: "Management linked margin outcomes to fulfillment and marketing efficiency.",
+                  source_ref: `p${index + 2}`,
+                },
               ],
-              implication: "Sustaining quality growth depends on balancing scale and cost discipline.",
+              why_it_matters: "Sustaining quality growth depends on balancing scale and cost discipline.",
               confidence: 0.84,
-            },
+            })),
           ],
         }),
         usage: {},

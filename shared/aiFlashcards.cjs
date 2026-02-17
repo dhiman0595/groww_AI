@@ -1,10 +1,10 @@
 const FLASHCARD_TAGS = Object.freeze([
-  "Strategy",
   "Financials",
   "Product",
+  "Strategy",
+  "Operations",
   "Risk",
   "Regulation",
-  "Operations",
   "Guidance",
 ]);
 

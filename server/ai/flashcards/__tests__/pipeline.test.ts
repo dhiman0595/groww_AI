@@ -45,7 +45,7 @@ describe("flashcards theme pipeline", () => {
   it("assigns higher confidence when numeric and management signals are present", () => {
     const high = assignConfidenceFromCard({
       summary: "Management stated EBITDA margin moved to 16.4 percent and revenue grew 18 percent.",
-      implication: "This can support operating leverage if execution remains stable.",
+      why_it_matters: "This can support operating leverage if execution remains stable.",
       evidence: [
         "CFO stated EBITDA margin expanded by 120 bps to 16.4 percent.",
         "CEO said revenue growth was 18 percent year-on-year.",
@@ -53,7 +53,7 @@ describe("flashcards theme pipeline", () => {
     });
     const low = assignConfidenceFromCard({
       summary: "Team discussed several opportunities but gave limited specifics.",
-      implication: "The outlook remains uncertain.",
+      why_it_matters: "The outlook remains uncertain.",
       evidence: ["Discussion remained broad without clear quantified targets.", "No explicit timing commitment was shared."],
     });
 

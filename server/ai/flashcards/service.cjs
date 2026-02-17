@@ -7,7 +7,6 @@ const {
 const {
   assignConfidenceFromCard,
   buildThemeCandidates,
-  buildThemePromptContext,
   clampConfidence,
   createFallbackCardsFromThemes,
   detectThemeTag,
@@ -32,6 +31,7 @@ const FLASHCARDS_CACHE_MAX_ENTRIES = Math.max(
   Math.min(Number(process.env.FLASHCARDS_CACHE_MAX_ENTRIES || 500), 5000)
 );
 const MIN_DEFAULT_CARDS = 8;
+const MAX_DEFAULT_CARDS = 12;
 
 const sharedCache = new FlashcardsTtlCache({
   ttlMs: FLASHCARDS_CACHE_TTL_MS,
@@ -53,7 +53,7 @@ function hashText(value) {
 
 function truncateText(value, maxChars) {
   const text = normalizeWhitespace(value);
-  const size = Math.max(400, Number(maxChars) || 400);
+  const size = Math.max(1, Number(maxChars) || 1);
   if (text.length <= size) {
     return text;
   }
@@ -219,6 +219,181 @@ function buildMetadata(inputMetadata = {}) {
   };
 }
 
+function normalizeSourceRef(value) {
+  const normalized = `${value || ""}`.trim().toLowerCase().replace(/\s+/g, "");
+  const directMatch = normalized.match(/^p\d{1,4}$/);
+  if (directMatch) {
+    return directMatch[0];
+  }
+  const pageMatch = normalized.match(/^page(\d{1,4})$/);
+  if (pageMatch?.[1]) {
+    return `p${pageMatch[1]}`;
+  }
+  return "";
+}
+
+function detectEvidenceType(value) {
+  const text = `${value || ""}`;
+  return /\b\d+(?:\.\d+)?%?\b|₹|\bcr\b|\bcrore\b|\bbps\b|\bmn\b|\bmillion\b|\bbn\b|\bbillion\b/i.test(text)
+    ? "metric"
+    : "quote";
+}
+
+function parseExplicitPageChunks(documentText) {
+  const text = normalizeTranscriptText(documentText);
+  if (!text) {
+    return [];
+  }
+  const regex = /(?:^|\n)\s*(?:\[)?p(\d{1,4})(?:\])?\s*[:\-]\s*/gim;
+  const matches = Array.from(text.matchAll(regex));
+  if (matches.length === 0) {
+    return [];
+  }
+
+  const chunks = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const current = matches[index];
+    const next = matches[index + 1];
+    const page = Number(current?.[1]);
+    if (!Number.isFinite(page) || page <= 0) {
+      continue;
+    }
+    const start = (current.index || 0) + current[0].length;
+    const end = next ? next.index || text.length : text.length;
+    const chunkText = normalizeWhitespace(text.slice(start, end));
+    if (!chunkText) {
+      continue;
+    }
+    chunks.push({
+      page,
+      source_ref: `p${page}`,
+      text: chunkText,
+    });
+  }
+
+  return chunks;
+}
+
+function buildPseudoPageChunks(documentText, options = {}) {
+  const text = normalizeTranscriptText(documentText);
+  if (!text) {
+    return [];
+  }
+
+  const targetChars = Math.max(900, Math.min(Number(options.targetChars) || 1700, 2600));
+  const maxPages = Math.max(6, Math.min(Number(options.maxPages) || 50, 120));
+  const paragraphs = text
+    .split(/\n{2,}/)
+    .map((part) => normalizeWhitespace(part))
+    .filter((part) => part.length > 0);
+  const units = paragraphs.length > 0 ? paragraphs : text.split(/\n/).map((part) => normalizeWhitespace(part)).filter(Boolean);
+
+  const pages = [];
+  let current = "";
+
+  for (const unit of units) {
+    const next = current ? `${current}\n${unit}` : unit;
+    if (next.length > targetChars && current) {
+      const page = pages.length + 1;
+      pages.push({
+        page,
+        source_ref: `p${page}`,
+        text: current,
+      });
+      current = unit;
+      if (pages.length >= maxPages) {
+        break;
+      }
+      continue;
+    }
+    current = next;
+  }
+
+  if (current && pages.length < maxPages) {
+    const page = pages.length + 1;
+    pages.push({
+      page,
+      source_ref: `p${page}`,
+      text: current,
+    });
+  }
+
+  return pages.map((page) => ({
+    ...page,
+    text: normalizeWhitespace(page.text),
+  }));
+}
+
+function buildPageChunks(documentText) {
+  const explicit = parseExplicitPageChunks(documentText);
+  if (explicit.length > 0) {
+    return explicit;
+  }
+  return buildPseudoPageChunks(documentText);
+}
+
+function buildTranscriptContextWithPageMarkers(pageChunks, maxChars) {
+  const budget = Math.max(6_000, Number(maxChars) || 6_000);
+  if (!Array.isArray(pageChunks) || pageChunks.length === 0) {
+    return "";
+  }
+
+  const output = [];
+  let length = 0;
+  for (const page of pageChunks) {
+    const line = `${page.source_ref}: ${page.text}`;
+    const nextLength = length + line.length + 2;
+    if (nextLength > budget) {
+      break;
+    }
+    output.push(line);
+    length = nextLength;
+  }
+
+  return output.join("\n\n");
+}
+
+function inferSourceRefForEvidence(evidenceText, pageChunks, sourceRefHint) {
+  const hint = normalizeSourceRef(sourceRefHint);
+  if (hint) {
+    return hint;
+  }
+
+  const embeddedMatch = sanitizeCardText(evidenceText).toLowerCase().match(/\bp(\d{1,4})\b/);
+  if (embeddedMatch?.[1]) {
+    return `p${embeddedMatch[1]}`;
+  }
+
+  const pages = Array.isArray(pageChunks) ? pageChunks : [];
+  if (pages.length === 0) {
+    return "p1";
+  }
+
+  const tokens = tokenizeForGrounding(evidenceText);
+  if (tokens.length < 2) {
+    return pages[0].source_ref || "p1";
+  }
+
+  let bestRef = pages[0].source_ref || "p1";
+  let bestScore = -1;
+
+  for (const page of pages) {
+    const haystack = `${page.text || ""}`.toLowerCase();
+    let score = 0;
+    for (const token of tokens) {
+      if (haystack.includes(token)) {
+        score += 1;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestRef = page.source_ref || bestRef;
+    }
+  }
+
+  return bestRef;
+}
+
 function tokenizeForGrounding(value) {
   return sanitizeCardText(value)
     .toLowerCase()
@@ -261,25 +436,74 @@ function normalizeTag(tag, fallbackText) {
   return detectThemeTag(fallbackText);
 }
 
-function normalizeCardWithTheme(rawCard, theme, documentText) {
+function normalizeEvidenceEntry(rawEvidence, pageChunks, documentText, fallbackRef) {
+  if (!rawEvidence) {
+    return null;
+  }
+
+  const isObjectInput = typeof rawEvidence === "object" && !Array.isArray(rawEvidence);
+  const text = truncateText(
+    sanitizeCardText(isObjectInput ? rawEvidence.text || rawEvidence.claim || "" : rawEvidence),
+    320
+  );
+  if (text.length < 8) {
+    return null;
+  }
+  if (!isEvidenceGrounded(text, documentText)) {
+    return null;
+  }
+
+  const type = isObjectInput && (rawEvidence.type === "metric" || rawEvidence.type === "quote")
+    ? rawEvidence.type
+    : detectEvidenceType(text);
+  const sourceRef = inferSourceRefForEvidence(
+    text,
+    pageChunks,
+    isObjectInput ? rawEvidence.source_ref || rawEvidence.sourceRef || fallbackRef : fallbackRef
+  );
+
+  return {
+    type,
+    text,
+    source_ref: sourceRef || "p1",
+  };
+}
+
+function normalizeCardWithTheme(rawCard, theme, documentText, pageChunks) {
   const title = truncateText(sanitizeCardText(rawCard?.title || theme?.title || "Theme update"), 90);
   const summary = truncateText(sanitizeCardText(rawCard?.summary || rawCard?.explanation || theme?.text || ""), 850);
-  const implication = truncateText(
-    sanitizeCardText(rawCard?.implication || rawCard?.why_it_matters || "This should be tracked in future disclosures."),
+  const whyItMatters = truncateText(
+    sanitizeCardText(
+      rawCard?.why_it_matters || rawCard?.implication || "This should be tracked in future disclosures."
+    ),
     420
   );
 
   const rawEvidence = Array.isArray(rawCard?.evidence)
-    ? rawCard.evidence.map((line) => truncateText(sanitizeCardText(line), 320)).filter((line) => line.length > 8)
+    ? rawCard.evidence
     : [];
   const fallbackEvidence = Array.isArray(theme?.evidence)
-    ? theme.evidence.map((line) => truncateText(sanitizeCardText(line), 320)).filter((line) => line.length > 8)
+    ? theme.evidence
     : [];
-  const combinedEvidence = Array.from(new Set([...rawEvidence, ...fallbackEvidence]))
-    .filter((line) => isEvidenceGrounded(line, documentText))
-    .slice(0, 4);
+  const fallbackRef = Array.isArray(theme?.pageRefs) && theme.pageRefs.length > 0 ? theme.pageRefs[0] : "p1";
+  const combinedEvidence = [...rawEvidence, ...fallbackEvidence]
+    .map((item) => normalizeEvidenceEntry(item, pageChunks, documentText, fallbackRef))
+    .filter((item) => Boolean(item));
 
-  const evidence = combinedEvidence.length >= 2 ? combinedEvidence : fallbackEvidence.slice(0, 2);
+  const dedupedEvidence = [];
+  const seen = new Set();
+  for (const item of combinedEvidence) {
+    const key = `${item.type}|${item.source_ref}|${item.text.toLowerCase()}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    dedupedEvidence.push(item);
+    if (dedupedEvidence.length >= 6) {
+      break;
+    }
+  }
+  const evidence = dedupedEvidence.slice(0, 6);
   if (evidence.length < 2) {
     return null;
   }
@@ -287,7 +511,7 @@ function normalizeCardWithTheme(rawCard, theme, documentText) {
   const confidenceInput = Number(rawCard?.confidence);
   const computedConfidence = assignConfidenceFromCard({
     summary,
-    implication,
+    why_it_matters: whyItMatters,
     evidence,
   });
   const confidence = clampConfidence(Number.isFinite(confidenceInput) ? confidenceInput : computedConfidence);
@@ -298,7 +522,7 @@ function normalizeCardWithTheme(rawCard, theme, documentText) {
     tag: normalizeTag(rawCard?.tag, `${summary} ${theme?.text || ""}`),
     summary,
     evidence,
-    implication,
+    why_it_matters: whyItMatters,
     confidence,
   };
 }
@@ -318,7 +542,7 @@ function dedupeCards(cards) {
 }
 
 function alignCardCount(cards, themes, maxCards) {
-  const targetMax = Math.max(MIN_DEFAULT_CARDS, Math.min(Number(maxCards) || 12, 14));
+  const targetMax = Math.max(MIN_DEFAULT_CARDS, Math.min(Number(maxCards) || 12, MAX_DEFAULT_CARDS));
   let output = dedupeCards(cards).slice(0, targetMax);
 
   if (output.length < MIN_DEFAULT_CARDS) {
@@ -359,46 +583,92 @@ function alignCardCount(cards, themes, maxCards) {
 
 function buildPromptSections(payload) {
   const systemPrompt = [
-    "System role: You are an expert financial-document synthesizer for earnings call transcripts.",
-    "Output must be factual, concise, and strictly grounded in provided transcript evidence.",
-    "Never invent numbers, timelines, guidance, or management claims.",
-    "Facts belong in summary/evidence; inference belongs only in implication.",
-    "No investment advice language.",
+    "[SYSTEM]",
+    "You are a senior equity-research assistant. Your job is to generate high-signal, evidence-backed flashcards from earnings-call/concall transcripts.",
+    "",
+    "You must be:",
+    "- Fact-first",
+    "- Concise",
+    "- Non-repetitive",
+    "- Explicit about uncertainty",
+    "",
+    "Never invent numbers, timelines, management guidance, or product details.",
+    "If a claim is not clearly supported in the transcript context, do not include it.",
   ].join("\n");
 
   const developerPrompt = [
-    "Developer rules:",
+    "[DEVELOPER]",
+    "Return STRICT JSON ONLY. No markdown. No prose before/after JSON.",
+    "",
+    "Output schema (must match exactly):",
+    "{",
+    '  "meta": {',
+    '    "company": "string",',
+    '    "period": "string",',
+    '    "doc_type": "concall_transcript",',
+    '    "generated_at": "ISO-8601 string"',
+    "  },",
+    '  "cards": [',
+    "    {",
+    '      "id": "string",',
+    '      "title": "string (<= 90 chars)",',
+    '      "tag": "Financials|Product|Strategy|Operations|Risk|Regulation|Guidance",',
+    '      "summary": "2-4 sentences, factual",',
+    '      "evidence": [',
+    "        {",
+    '          "type": "metric|quote",',
+    '          "text": "string",',
+    '          "source_ref": "p<number>"',
+    "        },",
+    "        {",
+    '          "type": "metric|quote",',
+    '          "text": "string",',
+    '          "source_ref": "p<number>"',
+    "        }",
+    "      ],",
+    '      "why_it_matters": "1-2 sentences, specific and non-generic",',
+    '      "confidence": 0.0',
+    "    }",
+    "  ]",
+    "}",
+    "",
+    "Hard rules:",
+    "1) Generate 8 to 12 cards total.",
+    "2) Each card must have at least 2 evidence items.",
+    "3) Every evidence item must include: exact claim text and source_ref in format p3, p14, etc.",
+    "4) Use only transcript-grounded facts in summary/evidence.",
+    "5) why_it_matters may include interpretation, but must be directly supported by evidence.",
+    "6) No duplicate themes. Merge overlaps and avoid repeated metrics without new context.",
+    "7) Confidence calibration:",
+    "   - 0.90-0.98: explicit metric + clear management statement",
+    "   - 0.78-0.89: explicit qualitative statement, moderate specificity",
+    "   - 0.65-0.77: inference from multiple supported facts",
+    "   - <0.65: include only if highly material and clearly uncertain",
+    "8) Do not output placeholders like N/A, unknown, or empty strings.",
+    "9) Ensure tag diversity:",
+    "   - at least 3 Financials cards",
+    "   - at least 2 cards across Product/Strategy",
+    "   - at least 1 card from Risk/Regulation/Guidance",
+    "10) Keep language analyst-grade: precise, neutral, non-promotional, no investment advice.",
+    `Target card count for this run: ${Math.max(MIN_DEFAULT_CARDS, Math.min(Number(payload.maxCards) || 12, MAX_DEFAULT_CARDS))}.`,
+    "",
+    "Quality bar:",
+    "- Card title should state one clear thesis.",
+    "- summary should describe what happened.",
+    "- why_it_matters should explain why this is important now.",
+    "- evidence should be audit-friendly.",
+    "",
     "- Return valid minified JSON only. No markdown, no prose.",
-    "- Strict schema:",
-    '{"meta":{"company":"string","period":"string","doc_type":"concall_transcript","generated_at":"ISO8601"},"cards":[{"id":"uuid","title":"<=90 chars","tag":"Strategy|Financials|Product|Risk|Regulation|Operations|Guidance","summary":"2-4 sentences","evidence":["bullet 1","bullet 2"],"implication":"1-2 sentences","confidence":0.0}]}',
-    `- Generate ${MIN_DEFAULT_CARDS} to ${payload.maxCards} cards.`,
-    "- Each card must include at least 2 evidence bullets grounded in transcript text.",
-    "- Reject weak themes that have insufficient evidence.",
-    "- Merge near-duplicate themes.",
-    "- Confidence scoring guidance: 0.85-1 explicit management + numeric support; 0.65-0.84 clear qualitative; <0.65 only if materially important.",
-    "- Keep tone factual and concise.",
   ].join("\n");
 
   const userPrompt = [
-    "User payload:",
-    JSON.stringify(
-      {
-        metadata: payload.metadata,
-        maxCards: payload.maxCards,
-      },
-      null,
-      0
-    ),
-    "",
-    "Pre-clustered thematic context (materiality-ranked):",
-    payload.themePromptLines.join("\n\n"),
-    "",
+    "[USER]",
+    `Company: ${payload.metadata.company}`,
+    `Period: ${payload.metadata.period}`,
+    "Document type: Concall Transcript",
+    "Transcript context with page markers:",
+    payload.transcriptWithPageMarkers,
     payload.externalSummaryText ? `External summary text:\n${payload.externalSummaryText}` : "",
-    "",
-    "Transcript digest (chunked window):",
-    payload.transcriptDigest,
-    "",
-    "Return valid minified JSON only. No markdown, no prose.",
   ]
     .filter((part) => `${part}`.trim().length > 0)
     .join("\n");
@@ -412,21 +682,25 @@ function buildPromptSections(payload) {
 function buildRepairPrompt(options) {
   return {
     systemPrompt: [
-      "You are a JSON repair assistant.",
-      "Repair the previous model output so it matches the exact required schema.",
+      "[SYSTEM]",
+      "You are a JSON repair assistant for financial flashcards.",
+      "Repair only format/schema issues while preserving original grounded claims.",
       "Return valid minified JSON only. No markdown, no prose.",
     ].join("\n"),
     userPrompt: [
+      "[DEVELOPER]",
+      "Repair this output to match the exact schema and rules below.",
+      "",
+      "Schema reminder:",
+      '{"meta":{"company":"string","period":"string","doc_type":"concall_transcript","generated_at":"ISO-8601 string"},"cards":[{"id":"string","title":"string (<= 90 chars)","tag":"Financials|Product|Strategy|Operations|Risk|Regulation|Guidance","summary":"2-4 sentences, factual","evidence":[{"type":"metric|quote","text":"string","source_ref":"p<number>"},{"type":"metric|quote","text":"string","source_ref":"p<number>"}],"why_it_matters":"1-2 sentences, specific and non-generic","confidence":0.0}]}',
+      `Hard constraints: cards must be ${MIN_DEFAULT_CARDS}-${MAX_DEFAULT_CARDS}; every card needs >=2 evidence objects with source_ref p<number>.`,
+      "",
+      "[USER]",
       "Validation error:",
       options.errorMessage,
       "",
       "Previous model output:",
       options.rawOutput,
-      "",
-      "Schema reminder:",
-      '{"meta":{"company":"string","period":"string","doc_type":"concall_transcript","generated_at":"ISO8601"},"cards":[{"id":"uuid","title":"<=90 chars","tag":"Strategy|Financials|Product|Risk|Regulation|Operations|Guidance","summary":"2-4 sentences","evidence":["bullet 1","bullet 2"],"implication":"1-2 sentences","confidence":0.0}]}',
-      `Cards required: ${MIN_DEFAULT_CARDS}-${options.maxCards}.`,
-      "Return valid minified JSON only. No markdown, no prose.",
     ].join("\n"),
   };
 }
@@ -453,30 +727,16 @@ function deriveThemeSet(documentText, maxCards) {
       title: truncateText(line, 90),
       materiality: 1 + index * 0.01,
       speakers: ["Unknown speaker"],
-      evidence: [line, line],
+      evidence: [line, `Management commentary: ${line}`],
+      pageRefs: [`p${index + 1}`],
       text: line,
     }));
 
   return fallbackText;
 }
 
-function buildTranscriptDigest(themes, documentText, maxCards) {
-  const lines = buildThemePromptContext(themes, {
-    limit: Math.max(maxCards + 2, 12),
-  });
-  const compact = lines.join("\n\n---\n\n");
-  if (compact.length >= FLASHCARDS_MAX_CONTEXT_CHARS * 0.55) {
-    return compact.slice(0, Math.floor(FLASHCARDS_MAX_CONTEXT_CHARS * 0.55));
-  }
-
-  const transcript = normalizeTranscriptText(documentText);
-  const remaining = Math.max(1_500, FLASHCARDS_MAX_CONTEXT_CHARS - compact.length - 120);
-  const tailChars = Math.floor(remaining * 0.35);
-  const headChars = remaining - tailChars;
-  const head = transcript.slice(0, headChars);
-  const tail = transcript.length > tailChars ? transcript.slice(-tailChars) : "";
-  const stitched = [compact, "Transcript window (head + tail):", head, tail].filter(Boolean).join("\n\n");
-  return stitched.slice(0, FLASHCARDS_MAX_CONTEXT_CHARS);
+function buildTranscriptDigest(pageChunks) {
+  return buildTranscriptContextWithPageMarkers(pageChunks, FLASHCARDS_MAX_CONTEXT_CHARS);
 }
 
 async function defaultGeminiCaller(options) {
@@ -490,7 +750,7 @@ function createFlashcardsService(options = {}) {
 
   async function generateFlashcards(input, requestOptions = {}) {
     const startedAt = Date.now();
-    const maxCards = Math.max(MIN_DEFAULT_CARDS, Math.min(Number(input.maxCards) || 12, 14));
+    const maxCards = Math.max(MIN_DEFAULT_CARDS, Math.min(Number(input.maxCards) || 12, MAX_DEFAULT_CARDS));
     const metadata = buildMetadata(input.metadata);
     const documentText = normalizeTranscriptText(input.documentText);
     const externalSummaryText = truncateText(sanitizeCardText(input.externalSummaryText || ""), 12_000);
@@ -521,17 +781,14 @@ function createFlashcardsService(options = {}) {
     }
 
     const pending = (async () => {
+      const pageChunks = buildPageChunks(documentText);
       const themes = deriveThemeSet(documentText, maxCards);
-      const themePromptLines = buildThemePromptContext(themes, {
-        limit: Math.max(maxCards + 2, 12),
-      });
-      const transcriptDigest = buildTranscriptDigest(themes, documentText, maxCards);
+      const transcriptWithPageMarkers = buildTranscriptDigest(pageChunks);
       const { systemPrompt, userPrompt } = buildPromptSections({
         metadata,
         maxCards,
         externalSummaryText,
-        themePromptLines,
-        transcriptDigest,
+        transcriptWithPageMarkers,
       });
 
       let rawModelText = "";
@@ -552,7 +809,9 @@ function createFlashcardsService(options = {}) {
           throw new Error("Model output did not include cards.");
         }
         const normalizedCards = cardCandidates
-          .map((candidate, index) => normalizeCardWithTheme(candidate, themes[index % themes.length], documentText))
+          .map((candidate, index) =>
+            normalizeCardWithTheme(candidate, themes[index % themes.length], documentText, pageChunks)
+          )
           .filter((card) => Boolean(card));
         if (normalizedCards.length === 0) {
           throw new Error("Model cards were not valid after grounding checks.");

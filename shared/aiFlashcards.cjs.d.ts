@@ -1,10 +1,10 @@
 export type FlashcardTag =
-  | "Strategy"
   | "Financials"
   | "Product"
+  | "Strategy"
+  | "Operations"
   | "Risk"
   | "Regulation"
-  | "Operations"
   | "Guidance";
 
 export interface AiFlashcardsMeta {
@@ -19,9 +19,15 @@ export interface AiFlashcard {
   title: string;
   tag: FlashcardTag;
   summary: string;
-  evidence: [string, ...string[]];
-  implication: string;
+  evidence: [AiFlashcardEvidence, ...AiFlashcardEvidence[]];
+  why_it_matters: string;
   confidence: number;
+}
+
+export interface AiFlashcardEvidence {
+  type: "metric" | "quote";
+  text: string;
+  source_ref: string;
 }
 
 export interface AiFlashcardsResponse {

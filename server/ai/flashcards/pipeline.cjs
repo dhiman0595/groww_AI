@@ -393,6 +393,58 @@ function pickEvidenceBullets(text, target = 4) {
   return bullets;
 }
 
+function normalizeSourceRef(value) {
+  const matched = `${value || ""}`.trim().toLowerCase().match(/^p\d{1,4}$/);
+  return matched ? matched[0] : "";
+}
+
+function extractPageRefsFromText(text) {
+  const refs = new Set();
+  const regex = /\b(?:p|page)\s*[-:]?\s*(\d{1,4})\b/gi;
+  const normalized = normalizeWhitespace(text);
+  let match = regex.exec(normalized);
+  while (match) {
+    const page = Number(match[1]);
+    if (Number.isFinite(page) && page > 0) {
+      refs.add(`p${page}`);
+    }
+    match = regex.exec(normalized);
+  }
+  return Array.from(refs);
+}
+
+function classifyEvidenceType(text) {
+  return /\b\d+(?:\.\d+)?%?\b|₹|\bcr\b|\bcrore\b|\bps\b/i.test(`${text || ""}`) ? "metric" : "quote";
+}
+
+function toEvidenceItemsFromLines(lines, pageRefs) {
+  const refs = Array.isArray(pageRefs) && pageRefs.length > 0 ? pageRefs.map(normalizeSourceRef).filter(Boolean) : ["p1"];
+  const evidence = [];
+  const seen = new Set();
+
+  for (const rawLine of Array.isArray(lines) ? lines : []) {
+    const text = normalizeWhitespace(rawLine).replace(/^[\-*]\s*/, "");
+    if (text.length < 8) {
+      continue;
+    }
+    const key = text.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    evidence.push({
+      type: classifyEvidenceType(text),
+      text: text.slice(0, 320),
+      source_ref: refs[evidence.length % refs.length] || "p1",
+    });
+    if (evidence.length >= 6) {
+      break;
+    }
+  }
+
+  return evidence;
+}
+
 function deriveThemeTitle(text, tag, maxLength = 90) {
   const firstSentence = toSentences(text)[0] || normalizeWhitespace(text).slice(0, maxLength);
   const cleaned = firstSentence.replace(/[^\w\s%.,:/()-]/g, "").trim();
@@ -440,6 +492,7 @@ function buildThemeCandidates(documentText, options = {}) {
       const tag = detectThemeTag(text);
       const materiality = scoreMateriality(text);
       const evidence = pickEvidenceBullets(text, 4);
+      const pageRefs = extractPageRefsFromText(text);
       return {
         id: `theme-${index + 1}`,
         tag,
@@ -447,6 +500,7 @@ function buildThemeCandidates(documentText, options = {}) {
         materiality,
         speakers: Array.from(cluster.speakers),
         evidence,
+        pageRefs,
         text,
       };
     })
@@ -496,6 +550,7 @@ function mergeNearDuplicateThemes(themes, threshold = 0.62) {
       target.text = normalizeWhitespace(`${target.text} ${theme.text}`);
       target.evidence = Array.from(new Set([...target.evidence, ...theme.evidence])).slice(0, 6);
       target.speakers = Array.from(new Set([...target.speakers, ...theme.speakers]));
+      target.pageRefs = Array.from(new Set([...(target.pageRefs || []), ...(theme.pageRefs || [])]));
       target.tag = target.materiality >= theme.materiality ? target.tag : theme.tag;
       continue;
     }
@@ -504,6 +559,7 @@ function mergeNearDuplicateThemes(themes, threshold = 0.62) {
       ...theme,
       speakers: [...theme.speakers],
       evidence: [...theme.evidence],
+      pageRefs: [...(theme.pageRefs || [])],
     });
   }
 
@@ -527,6 +583,7 @@ function buildThemePromptContext(themes, options = {}) {
       `Tag hint: ${theme.tag}`,
       `Materiality score: ${theme.materiality.toFixed(2)}`,
       `Speakers: ${theme.speakers.join(", ") || "Unknown"}`,
+      `Page refs: ${Array.isArray(theme.pageRefs) && theme.pageRefs.length > 0 ? theme.pageRefs.join(", ") : "p1"}`,
       "Evidence candidates:",
       evidenceLines,
       "",
@@ -544,9 +601,13 @@ function clampConfidence(value) {
 
 function assignConfidenceFromCard(card) {
   const summary = normalizeWhitespace(card?.summary || "");
-  const implication = normalizeWhitespace(card?.implication || "");
-  const evidence = Array.isArray(card?.evidence) ? card.evidence.join(" ") : "";
-  const combined = `${summary} ${implication} ${evidence}`.toLowerCase();
+  const whyItMatters = normalizeWhitespace(card?.why_it_matters || card?.implication || "");
+  const evidence = Array.isArray(card?.evidence)
+    ? card.evidence
+        .map((item) => (typeof item === "string" ? item : normalizeWhitespace(item?.text || "")))
+        .join(" ")
+    : "";
+  const combined = `${summary} ${whyItMatters} ${evidence}`.toLowerCase();
 
   const numericSignals = (combined.match(/\b\d+(?:\.\d+)?%?\b/g) || []).length;
   const managementSignal = /(management|ceo|cfo|stated|said|noted|guided|expects)/.test(combined);
@@ -586,23 +647,24 @@ function formatFallbackImplication(theme) {
 
 function createFallbackCardsFromThemes(options) {
   const themes = Array.isArray(options.themes) ? options.themes : [];
-  const maxCards = Math.max(8, Math.min(Number(options.maxCards) || 12, 14));
+  const maxCards = Math.max(8, Math.min(Number(options.maxCards) || 12, 12));
 
   return themes.slice(0, maxCards).map((theme) => {
     const summary = formatFallbackSummary(theme);
-    const implication = formatFallbackImplication(theme);
+    const whyItMatters = formatFallbackImplication(theme);
+    const evidence = toEvidenceItemsFromLines(theme.evidence.slice(0, 4), theme.pageRefs);
     const confidence = assignConfidenceFromCard({
       summary,
-      implication,
-      evidence: theme.evidence,
+      why_it_matters: whyItMatters,
+      evidence,
     });
     return {
       id: randomUUID(),
       title: deriveThemeTitle(theme.title || summary, theme.tag),
       tag: detectThemeTag(`${theme.tag} ${theme.text}`),
       summary,
-      evidence: theme.evidence.slice(0, 4),
-      implication,
+      evidence,
+      why_it_matters: whyItMatters,
       confidence: clampConfidence(confidence),
     };
   });

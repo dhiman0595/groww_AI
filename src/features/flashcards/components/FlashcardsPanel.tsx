@@ -19,12 +19,12 @@ import type {
 
 const TAG_FILTER_OPTIONS: Array<"ALL" | FlashcardTag> = [
   "ALL",
-  "Strategy",
   "Financials",
   "Product",
+  "Strategy",
+  "Operations",
   "Risk",
   "Regulation",
-  "Operations",
   "Guidance",
 ];
 
@@ -431,9 +431,9 @@ export function FlashcardsPanel({
 
                       {isEvidenceExpanded ? (
                         <ul className="mt-2 space-y-1 rounded-lg border border-slate-200 bg-slate-50 p-2.5 text-xs text-slate-700">
-                          {card.evidence.map((line, index) => (
+                          {card.evidence.map((item, index) => (
                             <li key={`${card.id}-evidence-${index}`} className="leading-relaxed">
-                              - {line}
+                              - [{item.source_ref}] ({item.type}) {item.text}
                             </li>
                           ))}
                         </ul>
@@ -441,7 +441,7 @@ export function FlashcardsPanel({
 
                       <div className="mt-2 rounded-lg border border-emerald-100 bg-emerald-50/70 p-2.5">
                         <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">Why it matters</p>
-                        <p className="mt-1 text-xs leading-relaxed text-slate-700">{card.implication}</p>
+                        <p className="mt-1 text-xs leading-relaxed text-slate-700">{card.why_it_matters}</p>
                       </div>
 
                       <div className="mt-2">

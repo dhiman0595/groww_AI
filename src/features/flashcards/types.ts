@@ -1,5 +1,6 @@
 import type {
   AiFlashcard,
+  AiFlashcardEvidence,
   AiFlashcardsRequest,
   AiFlashcardsRequestMetadata,
   AiFlashcardsResponse,
@@ -8,6 +9,7 @@ import type {
 
 export type {
   AiFlashcard,
+  AiFlashcardEvidence,
   AiFlashcardsRequest,
   AiFlashcardsRequestMetadata,
   AiFlashcardsResponse,
