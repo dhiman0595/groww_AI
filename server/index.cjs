@@ -1608,6 +1608,10 @@ function normalizeSummaryCard(rawCard, index, documents) {
   };
 }
 
+function hasConcallDocument(documents) {
+  return Array.isArray(documents) && documents.some((document) => document?.doc_type === "CONCALL_TRANSCRIPT");
+}
+
 function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
   const baseDocument = documents[0];
   if (!baseDocument) {
@@ -1628,6 +1632,63 @@ function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
 
   const docTitle = baseDocument.title;
   const sourceRef = normalizeCardSources([], baseDocument);
+  const isConcall = hasConcallDocument(documents);
+
+  if (isConcall) {
+    return [
+      {
+        id: createSummaryCardId(`${docTitle}-c1`),
+        concept: "Strategic developments",
+        title: "1) Key strategic developments and implications",
+        explanation:
+          "What management said:\n" +
+          "- Focus areas, capital allocation, and growth priorities highlighted in this concall.\n" +
+          "What changed:\n" +
+          "- Compare commentary with prior quarter narrative where available.\n" +
+          "Numbers/operating signals:\n" +
+          "- Capture any explicit guidance, scale metrics, and contribution trends.",
+        why_it_matters:
+          "This card anchors the quarter’s strategic message before evaluating segment-level economics.",
+        example: "Actionable investor read: Track whether strategy claims convert into measurable metrics next quarter.",
+        level: 1,
+        source_refs: sourceRef,
+      },
+      {
+        id: createSummaryCardId(`${docTitle}-c2`),
+        concept: "Segment and product signals",
+        title: "2) Segment updates: growth vs profitability trade-offs",
+        explanation:
+          "What management said:\n" +
+          "- Segment-wise momentum, product expansion, and competitive positioning.\n" +
+          "What changed:\n" +
+          "- Where investment intensity increased/decreased versus recent quarters.\n" +
+          "Numbers/operating signals:\n" +
+          "- Revenue mix, user cohorts, CAC/LTV, unit economics, and contribution indicators.",
+        why_it_matters:
+          "Segment-level trade-offs explain near-term margin volatility and medium-term compounding potential.",
+        example: "Actionable investor read: Distinguish durable operating leverage from investment-led margin pressure.",
+        level: 2,
+        source_refs: sourceRef,
+      },
+      {
+        id: createSummaryCardId(`${docTitle}-c3`),
+        concept: "Risk and monitorables",
+        title: "3) Risks, regulation, and next-quarter monitorables",
+        explanation:
+          "What management said:\n" +
+          "- Regulatory stance, risk controls, platform reliability, and capital discipline.\n" +
+          "What changed:\n" +
+          "- New risks disclosed or softened/strengthened guidance language.\n" +
+          "Numbers/operating signals:\n" +
+          "- KPI thresholds to track (growth, margins, cash use, customer quality).",
+        why_it_matters:
+          "A strong thesis needs explicit invalidation triggers and a monitorables checklist.",
+        example: "Actionable investor read: Build a 5-point checklist to verify management claims each quarter.",
+        level: 3,
+        source_refs: sourceRef,
+      },
+    ];
+  }
 
   return [
     {
@@ -1674,6 +1735,7 @@ function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
 
 function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }) {
   const fallbackDocument = documents[0];
+  const isConcall = hasConcallDocument(documents);
   const deeper = swipeDirection === "right";
   const nextLevel = deeper
     ? normalizeCardLevel((currentCard?.level ?? 1) + 1, 2)
@@ -1686,8 +1748,12 @@ function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }
     concept,
     title,
     explanation: deeper
-      ? "This deeper layer focuses on cause-effect links between commentary, numbers, and likely forward implications."
-      : "This view explains the same evidence from a different perspective to improve understanding.",
+      ? isConcall
+        ? "Go deeper into this concall theme: add evidence-backed implications, counterpoints, and monitorables."
+        : "This deeper layer focuses on cause-effect links between commentary, numbers, and likely forward implications."
+      : isConcall
+        ? "Reframe this concall theme from a clearer alternate lens while keeping evidence and implications intact."
+        : "This view explains the same evidence from a different perspective to improve understanding.",
     why_it_matters: deeper
       ? "Depth helps detect thesis strength, fragility, and consistency over time."
       : "Alternative perspectives reduce blind spots and improve clarity.",
@@ -2245,6 +2311,7 @@ async function generateSummaryCardsWithGrok({
   if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
     throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY on the backend.");
   }
+  const isConcallStyle = hasConcallDocument(documents);
 
   const docContextLines = buildContextLines(documents).join("\n\n");
   const chunkContextLines = buildChunkContextLines(Array.isArray(ragChunks) ? ragChunks : []).join("\n\n");
@@ -2258,41 +2325,73 @@ async function generateSummaryCardsWithGrok({
     "Use only provided filing context.",
     "Each card must include: concept, title, explanation, why_it_matters, example, level, source_refs.",
     "Cards must be evidence-grounded and beginner-friendly.",
+    "Do not create management-org-chart style output unless explicitly asked.",
+    "Do not use markdown formatting like **bold** or * bullets.",
     "When evidence is weak, say what is not available instead of guessing.",
     "If swipe direction is right: increase depth and specificity, include tighter evidence links from filings.",
     "If swipe direction is left: keep core meaning but switch to clearer alternate framing (analogy, decomposition, or contrast).",
     "For right swipe, level should not decrease. For left swipe, keep level same or reduce by 1 if needed for clarity.",
     "source_refs should be an array of objects with title and optional url/source_name.",
+    isConcallStyle
+      ? "For concall documents, write like a structured analyst note: strategic themes, segment economics, guidance, risks, and monitorables."
+      : "For non-concall documents, keep cards concise and progressive from overview to evidence-backed interpretation.",
   ].join("\n");
 
   const userPrompt =
     mode === "summary_cards_init"
-      ? [
-          `Company: ${companyName || symbol}`,
-          `Symbol: ${symbol}`,
-          "Task: Create 3 progressive knowledge cards (level 1 -> 3).",
-          "Use this exact concept order:",
-          "1) Company overview",
-          "2) What does the company do",
-          "3) Company financial info from the selected filing",
-          "Tone: plain language, high clarity, no investment advice.",
-          "For concall/transcript evidence, format card 3 explanation like a compact operational summary:",
-          "- Short heading line with period/context",
-          "- Numbered key takeaways",
-          "- Include at least one 'Actionable investor read' line",
-          "Each card should reference evidence through source_refs.",
-          "Output JSON shape: {\"cards\":[{...},{...},{...}]}",
-          "Context:",
-          contextLines,
-        ].join("\n\n")
+      ? isConcallStyle
+        ? [
+            `Company: ${companyName || symbol}`,
+            `Symbol: ${symbol}`,
+            "Task: Create 8 to 12 knowledge cards from this concall.",
+            "Each card should represent one major theme (no duplication).",
+            "Title format: \"<index>) <theme>: <implication>\".",
+            "Required theme coverage across cards:",
+            "- Strategic developments and capital allocation",
+            "- Segment/product growth vs profitability trade-offs",
+            "- Operating metrics (user, CAC/LTV, revenue mix, margins, leverage/cash where available)",
+            "- Management commentary versus numbers",
+            "- Risks, regulation, and reliability/operating controls",
+            "- What changed this quarter vs recent quarters",
+            "Card field instructions:",
+            "- explanation: 3 compact parts in plain text: What management said | Numbers/signals | What changed",
+            "- why_it_matters: investor implication in 2-4 lines",
+            "- example: start with \"Actionable investor read:\" and give monitorables",
+            "No markdown symbols.",
+            "Each card should reference evidence through source_refs.",
+            "Output JSON shape: {\"cards\":[{...}]}",
+            "Context:",
+            contextLines,
+          ].join("\n\n")
+        : [
+            `Company: ${companyName || symbol}`,
+            `Symbol: ${symbol}`,
+            "Task: Create 3 progressive knowledge cards (level 1 -> 3).",
+            "Use this exact concept order:",
+            "1) Company overview",
+            "2) What does the company do",
+            "3) Company financial info from the selected filing",
+            "Tone: plain language, high clarity, no investment advice.",
+            "Card 3 should include numbered operational takeaways and one actionable monitorables line.",
+            "No markdown symbols.",
+            "Each card should reference evidence through source_refs.",
+            "Output JSON shape: {\"cards\":[{...},{...},{...}]}",
+            "Context:",
+            contextLines,
+          ].join("\n\n")
       : [
           `Company: ${companyName || symbol}`,
           `Symbol: ${symbol}`,
           `Current card: ${JSON.stringify(currentCard)}`,
           `Swipe direction: ${swipeDirection}`,
           swipeDirection === "right"
-            ? "Task: Generate exactly 1 deeper follow-up knowledge card with tighter report-grounded evidence and concrete implications."
-            : "Task: Generate exactly 1 alternate-perspective knowledge card that is easier to grasp without losing factual rigor.",
+            ? isConcallStyle
+              ? "Task: Generate exactly 1 deeper concall knowledge card with tighter evidence, counterpoints, and explicit next-quarter monitorables."
+              : "Task: Generate exactly 1 deeper follow-up knowledge card with tighter report-grounded evidence and concrete implications."
+            : isConcallStyle
+              ? "Task: Generate exactly 1 alternate-lens concall knowledge card that is easier to understand while preserving evidence and implications."
+              : "Task: Generate exactly 1 alternate-perspective knowledge card that is easier to grasp without losing factual rigor.",
+          "No markdown symbols.",
           "Output JSON shape: {\"cards\":[{...}]}",
           "Context:",
           contextLines,
