@@ -1612,6 +1612,46 @@ function hasConcallDocument(documents) {
   return Array.isArray(documents) && documents.some((document) => document?.doc_type === "CONCALL_TRANSCRIPT");
 }
 
+function stripLeadingCardNumber(title) {
+  return `${title || ""}`.replace(/^\s*\d+\)\s*/, "").trim();
+}
+
+function extractLeadingCardNumber(title) {
+  const match = `${title || ""}`.trim().match(/^(\d+)\)/);
+  if (!match?.[1]) {
+    return null;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function applyConcallCardNumbering(cards, options = {}) {
+  const safeCards = Array.isArray(cards) ? cards : [];
+  if (safeCards.length === 0) {
+    return safeCards;
+  }
+
+  const mode = `${options.mode || "summary_cards_init"}`;
+  if (mode === "summary_cards_next") {
+    const baseNumber = extractLeadingCardNumber(options.currentCard?.title) || 0;
+    return safeCards.map((card, index) => {
+      const cleanTitle = stripLeadingCardNumber(card?.title || "Knowledge card");
+      return {
+        ...card,
+        title: `${baseNumber + index + 1}) ${cleanTitle}`,
+      };
+    });
+  }
+
+  return safeCards.map((card, index) => {
+    const cleanTitle = stripLeadingCardNumber(card?.title || "Knowledge card");
+    return {
+      ...card,
+      title: `${index + 1}) ${cleanTitle}`,
+    };
+  });
+}
+
 function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
   const baseDocument = documents[0];
   if (!baseDocument) {
@@ -2423,8 +2463,15 @@ async function generateSummaryCardsWithGrok({
     .filter((value) => Boolean(value));
 
   if (normalizedCards.length > 0) {
+    const numberedCards = isConcallStyle
+      ? applyConcallCardNumbering(normalizedCards, {
+          mode,
+          currentCard,
+        })
+      : normalizedCards;
+
     return {
-      cards: normalizedCards,
+      cards: numberedCards,
       modelUsed: completion.modelUsed,
     };
   }
