@@ -98,6 +98,18 @@ async function ensureCompaniesMasterSchema() {
     ON companies_master (searchable_text);
   `);
 
+  try {
+    await activePool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm;`);
+    await activePool.query(`
+      CREATE INDEX IF NOT EXISTS companies_master_searchable_text_trgm_idx
+      ON companies_master
+      USING GIN (searchable_text gin_trgm_ops);
+    `);
+  } catch (error) {
+    // Trigram index is an optimization; continue if extension creation is restricted.
+    console.warn("Skipping pg_trgm index setup:", error.message);
+  }
+
   schemaEnsured = true;
   return true;
 }
