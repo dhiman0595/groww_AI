@@ -1,10 +1,12 @@
 import {
   useEffect,
+  lazy,
   useMemo,
+  Suspense,
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { ArrowLeft, ChevronDown, ChevronUp, SendHorizontal, Sparkles } from "lucide-react";
+import { ChevronDown, ChevronUp, SendHorizontal, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -20,7 +22,7 @@ import {
 import { CompanySelector } from "@/features/documents/components/CompanySelector";
 import { useCompaniesQuery } from "@/features/documents/state/useCompaniesQuery";
 import { useDocumentsQuery } from "@/features/documents/state/useDocumentsQuery";
-import type { CompanyDocument, DocumentTypeFilter } from "@/features/documents/types";
+import type { CompanyDocument, CompanyOption, DocumentTypeFilter } from "@/features/documents/types";
 
 interface ChatMessage {
   id: string;
@@ -62,6 +64,7 @@ const ROW_DOC_TYPES = new Set<CompanyDocument["doc_type"]>([
 ]);
 const SUMMARY_DECK_STORAGE_PREFIX = "summary-cards-v1";
 const SWIPE_THRESHOLD = 70;
+const CHAT_RENDER_LIMIT = 60;
 const FILINGS_DOC_TYPE_OPTIONS: Array<{ value: DocumentTypeFilter; label: string }> = [
   { value: "ALL", label: "All documents" },
   { value: "annual-report", label: "Annual Report" },
@@ -70,6 +73,12 @@ const FILINGS_DOC_TYPE_OPTIONS: Array<{ value: DocumentTypeFilter; label: string
   { value: "investor-presentation", label: "Investor Presentation" },
   { value: "announcement", label: "Announcement" },
 ];
+
+const SummaryDeckView = lazy(() =>
+  import("@/features/documents/components/SummaryDeckView").then((module) => ({
+    default: module.SummaryDeckView,
+  }))
+);
 
 function createEmptySession(): ChatSessionState {
   return {
@@ -287,9 +296,11 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
   const isGuestMode = accessMode === "guest";
   const [companySearchText, setCompanySearchText] = useState("");
   const [selectedSymbol, setSelectedSymbol] = useState("");
+  const [selectedCompaniesBySymbol, setSelectedCompaniesBySymbol] = useState<Record<string, CompanyOption>>({});
   const [draftQuestion, setDraftQuestion] = useState("");
   const [isAsking, setIsAsking] = useState(false);
   const [sessionsBySymbol, setSessionsBySymbol] = useState<Record<string, ChatSessionState>>({});
+  const [expandedChatBySymbol, setExpandedChatBySymbol] = useState<Record<string, boolean>>({});
   const [summaryDecksByKey, setSummaryDecksByKey] = useState<Record<string, SummaryDeckState>>({});
   const [selectedYearBySymbol, setSelectedYearBySymbol] = useState<Record<string, string>>({});
   const [selectedDocTypeBySymbol, setSelectedDocTypeBySymbol] = useState<Record<string, DocumentTypeFilter>>({});
@@ -301,6 +312,8 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
 
   const companiesQuery = useCompaniesQuery(companySearchText, {
     limit: isGuestMode ? 3 : undefined,
+    minChars: 2,
+    allowEmptyQuery: false,
   });
   const selectableCompanies = useMemo(
     () => (isGuestMode ? companiesQuery.data.slice(0, 3) : companiesQuery.data),
@@ -311,17 +324,21 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
   const selectedCompany = useMemo(
     () =>
       selectableCompanies.find((company) => company.symbol === effectiveSelectedSymbol) ??
+      selectedCompaniesBySymbol[effectiveSelectedSymbol] ??
       (!isGuestMode && effectiveSelectedSymbol
         ? {
             symbol: effectiveSelectedSymbol,
             company_name: effectiveSelectedSymbol,
           }
         : null),
-    [effectiveSelectedSymbol, isGuestMode, selectableCompanies]
+    [effectiveSelectedSymbol, isGuestMode, selectableCompanies, selectedCompaniesBySymbol]
   );
 
   useEffect(() => {
     if (!isGuestMode || !effectiveSelectedSymbol) {
+      return;
+    }
+    if (companySearchText.trim().length < 2) {
       return;
     }
 
@@ -332,14 +349,14 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
 
     setSelectedSymbol("");
     setCompanySearchText("");
-  }, [effectiveSelectedSymbol, isGuestMode, selectableCompanies]);
+  }, [companySearchText, effectiveSelectedSymbol, isGuestMode, selectableCompanies]);
 
   const selectedDocumentType = selectedDocTypeBySymbol[effectiveSelectedSymbol] ?? "ALL";
   const documentsQuery = useDocumentsQuery({
     symbol: effectiveSelectedSymbol,
     doc_type: selectedDocumentType,
     page: 1,
-    page_size: 120,
+    page_size: 40,
   });
 
   const companyDocuments = documentsQuery.data.items;
@@ -459,6 +476,14 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
 
   const activeSession = sessionsBySymbol[effectiveSelectedSymbol] ?? createEmptySession();
   const hasStartedChat = activeSession.messages.some((message) => message.role === "user");
+  const isChatExpanded = expandedChatBySymbol[effectiveSelectedSymbol] ?? false;
+  const visibleMessages = useMemo(() => {
+    if (isChatExpanded || activeSession.messages.length <= CHAT_RENDER_LIMIT) {
+      return activeSession.messages;
+    }
+    return activeSession.messages.slice(-CHAT_RENDER_LIMIT);
+  }, [activeSession.messages, isChatExpanded]);
+  const hiddenMessageCount = Math.max(0, activeSession.messages.length - visibleMessages.length);
 
   const initialSuggestions = useMemo(() => {
     if (!selectedCompany) {
@@ -837,13 +862,19 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
             <CompanySelector
               companies={selectableCompanies}
               selectedSymbol={selectedSymbol}
+              selectedCompanyName={selectedCompany?.company_name}
               searchText={companySearchText}
+              minSearchChars={2}
               onSearchTextChange={setCompanySearchText}
               onSelectSymbol={(symbol) => {
                 setSelectedSymbol(symbol);
                 const company = selectableCompanies.find((item) => item.symbol === symbol);
                 if (company) {
                   setCompanySearchText(company.company_name);
+                  setSelectedCompaniesBySymbol((previous) => ({
+                    ...previous,
+                    [company.symbol]: company,
+                  }));
                 }
               }}
               isLoading={companiesQuery.isLoading}
@@ -1064,156 +1095,32 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
                 Select a company to start chat and filing analysis.
               </div>
             ) : summaryView ? (
-              <>
-                <div className="flex items-center justify-between border-b border-slate-200 bg-white px-3 py-2.5">
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900"
-                    onClick={() => setSummaryView(null)}
-                  >
-                    <ArrowLeft className="size-3.5" />
-                    Back
-                  </button>
-                  <p className="line-clamp-1 max-w-[72%] text-xs font-medium text-slate-700">
-                    {summaryDocument?.title ?? "Document summary"}
-                  </p>
-                </div>
-
-                <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-                  <div className="space-y-3">
-                    {activeSummaryDeck.error ? (
-                      <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
-                        {activeSummaryDeck.error}
-                      </div>
-                    ) : null}
-
-                    {!currentSummaryCard && activeSummaryDeck.isLoading ? (
-                      <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-500">
-                        <span className="size-1.5 rounded-full bg-emerald-500" />
-                        Building your first battle card...
-                      </div>
-                    ) : null}
-
-                    {currentSummaryCard ? (
-                      <>
-                        <div className="flex items-center justify-between text-[11px] text-slate-500">
-                          <span>
-                            Card {activeSummaryDeck.currentIndex + 1} of {activeSummaryDeck.cards.length}
-                          </span>
-                          <span>Depth level {currentSummaryCard.level}/5</span>
-                        </div>
-
-                        <article
-                          className="relative select-none rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
-                          style={{
-                            transform: `translateX(${dragOffsetX}px) rotate(${dragOffsetX / 24}deg)`,
-                            transition: dragStartX === null ? "transform 180ms ease" : "none",
-                            touchAction: "pan-y",
-                          }}
-                          onPointerDown={handleSummaryCardPointerDown}
-                          onPointerMove={handleSummaryCardPointerMove}
-                          onPointerUp={handleSummaryCardPointerEnd}
-                          onPointerCancel={handleSummaryCardPointerEnd}
-                        >
-                          <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700">
-                            Swipe left: new perspective
-                          </div>
-                          <div className="pointer-events-none absolute right-3 top-3 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                            Swipe right: deeper from report
-                          </div>
-
-                          <div className="pt-7">
-                            <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-emerald-700">
-                              {currentSummaryCard.concept}
-                            </Badge>
-                            <h3 className="mt-2 text-base font-semibold text-slate-900">{currentSummaryCard.title}</h3>
-                            <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
-                              {currentSummaryCard.explanation}
-                            </p>
-
-                            <div className="mt-3 rounded-lg border border-emerald-100 bg-emerald-50/60 p-2.5">
-                              <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
-                                Why it matters
-                              </p>
-                              <p className="mt-1 text-xs leading-relaxed text-slate-700">
-                                {currentSummaryCard.why_it_matters}
-                              </p>
-                            </div>
-
-                            <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5">
-                              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">
-                                Example
-                              </p>
-                              <p className="mt-1 text-xs leading-relaxed text-slate-700">{currentSummaryCard.example}</p>
-                            </div>
-                          </div>
-                        </article>
-
-                        <div className="grid grid-cols-2 gap-2">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className="h-10 border-rose-200 text-xs text-rose-700 hover:bg-rose-50"
-                            disabled={activeSummaryDeck.isLoading}
-                            onClick={() => {
-                              void requestNextSummaryCard("left");
-                            }}
-                          >
-                            I need simpler
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className="h-10 border-emerald-200 text-xs text-emerald-700 hover:bg-emerald-50"
-                            disabled={activeSummaryDeck.isLoading}
-                            onClick={() => {
-                              void requestNextSummaryCard("right");
-                            }}
-                          >
-                            I understand, go deeper
-                          </Button>
-                        </div>
-
-                        {summarySources.length > 0 ? (
-                          <div className="flex flex-wrap gap-1.5">
-                            {summarySources.slice(0, 8).map((source, index) => {
-                              const hasLink = source.url && source.url.length > 0;
-                              const label = source.title || source.source_name || "Source";
-                              const key = `${label}-${source.url || index}`;
-
-                              return hasLink ? (
-                                <a
-                                  key={key}
-                                  href={source.url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-800"
-                                >
-                                  {label}
-                                </a>
-                              ) : (
-                                <span
-                                  key={key}
-                                  className="rounded-full border border-slate-200 bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600"
-                                >
-                                  {label}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                      </>
-                    ) : null}
-
-                    {currentSummaryCard && activeSummaryDeck.isLoading ? (
-                      <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-500">
-                        <span className="size-1.5 rounded-full bg-emerald-500" />
-                        Generating next card...
-                      </div>
-                    ) : null}
+              <Suspense
+                fallback={
+                  <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-500">
+                    Loading summary view...
                   </div>
-                </div>
-              </>
+                }
+              >
+                <SummaryDeckView
+                  summaryDocumentTitle={summaryDocument?.title}
+                  activeSummaryDeck={activeSummaryDeck}
+                  currentSummaryCard={currentSummaryCard}
+                  summarySources={summarySources}
+                  dragOffsetX={dragOffsetX}
+                  dragStartX={dragStartX}
+                  onBack={() => setSummaryView(null)}
+                  onPointerDown={handleSummaryCardPointerDown}
+                  onPointerMove={handleSummaryCardPointerMove}
+                  onPointerEnd={handleSummaryCardPointerEnd}
+                  onRequestLeft={() => {
+                    void requestNextSummaryCard("left");
+                  }}
+                  onRequestRight={() => {
+                    void requestNextSummaryCard("right");
+                  }}
+                />
+              </Suspense>
             ) : (
               <>
                 <div className="border-b border-slate-200 bg-white px-3 py-3">
@@ -1285,7 +1192,22 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
 
                 <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
                   <div className="space-y-3">
-                    {activeSession.messages.map((message) => (
+                    {hiddenMessageCount > 0 ? (
+                      <button
+                        type="button"
+                        className="mx-auto block rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] text-slate-600 hover:text-slate-900"
+                        onClick={() =>
+                          setExpandedChatBySymbol((previous) => ({
+                            ...previous,
+                            [effectiveSelectedSymbol]: true,
+                          }))
+                        }
+                      >
+                        Show {hiddenMessageCount} older message{hiddenMessageCount === 1 ? "" : "s"}
+                      </button>
+                    ) : null}
+
+                    {visibleMessages.map((message) => (
                       <article
                         key={message.id}
                         className={`max-w-[86%] rounded-2xl p-3 text-sm shadow-sm ${

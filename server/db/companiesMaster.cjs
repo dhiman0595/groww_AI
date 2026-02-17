@@ -129,7 +129,7 @@ async function fetchCompaniesFromMaster(options = {}) {
 
     const term = normalizeSearchableText(options.query);
     const requestedLimit = Number(options.limit);
-    const defaultLimit = term.length > 0 ? 1200 : 25000;
+    const defaultLimit = term.length > 0 ? 300 : 100;
     const limit = Math.max(
       1,
       Math.min(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 50000)

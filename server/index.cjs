@@ -2466,7 +2466,7 @@ app.get("/api/companies", async (req, res) => {
   try {
     const query = `${req.query.query || ""}`.trim().toLowerCase();
     const requestedLimit = Number(req.query.limit);
-    const defaultLimit = query.length > 0 ? 1200 : 25000;
+    const defaultLimit = query.length > 0 ? 300 : 100;
     const limit = Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit;
     if (!hasMasterDatabase()) {
       res.status(500).json({
@@ -2501,7 +2501,7 @@ app.get("/api/documents", async (req, res) => {
     const to = `${req.query.to || ""}`.trim();
     const sort = `${req.query.sort || "newest"}`.trim();
     const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.max(1, Math.min(Number(req.query.page_size || 10), 250));
+    const pageSize = Math.max(1, Math.min(Number(req.query.page_size || 10), 120));
 
     if (!symbol) {
       res.status(400).json({ error: "'symbol' query param is required." });
@@ -2527,11 +2527,6 @@ app.get("/api/documents", async (req, res) => {
     const sorted = sortRawDocuments(filtered, sort);
     const start = (page - 1) * pageSize;
     const end = start + pageSize;
-
-    if (hasRagDatabase() && (HAS_OLLAMA_CHAT || HAS_GEMINI_CHAT || HAS_XAI_CHAT)) {
-      const preloadDocuments = sorted.slice(0, RAG_INGEST_PRELOAD_LIMIT).map((item) => normalizeChatDocument(item));
-      void ensureRagCoverage(preloadDocuments, { blockingCount: 0 });
-    }
 
     res.json({
       items: sorted.slice(start, end),

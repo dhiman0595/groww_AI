@@ -4,6 +4,8 @@ import type { CompanyOption } from "@/features/documents/types";
 
 interface UseCompaniesQueryOptions {
   limit?: number;
+  minChars?: number;
+  allowEmptyQuery?: boolean;
 }
 
 export function useCompaniesQuery(query: string, options: UseCompaniesQueryOptions = {}) {
@@ -12,6 +14,8 @@ export function useCompaniesQuery(query: string, options: UseCompaniesQueryOptio
   const [error, setError] = useState<string | null>(null);
   const [debouncedQuery, setDebouncedQuery] = useState(query);
   const limit = Number.isFinite(options.limit) ? Number(options.limit) : undefined;
+  const minChars = Number.isFinite(options.minChars) ? Math.max(1, Number(options.minChars)) : 2;
+  const allowEmptyQuery = options.allowEmptyQuery === true;
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -24,6 +28,19 @@ export function useCompaniesQuery(query: string, options: UseCompaniesQueryOptio
   useEffect(() => {
     let active = true;
     const controller = new AbortController();
+    const normalizedQuery = debouncedQuery.trim();
+    const belowMinChars = normalizedQuery.length > 0 && normalizedQuery.length < minChars;
+    const shouldSkipFetch = (!allowEmptyQuery && normalizedQuery.length === 0) || belowMinChars;
+
+    if (shouldSkipFetch) {
+      setData([]);
+      setIsLoading(false);
+      setError(null);
+      return () => {
+        active = false;
+        controller.abort();
+      };
+    }
 
     async function run() {
       setIsLoading(true);
@@ -60,7 +77,7 @@ export function useCompaniesQuery(query: string, options: UseCompaniesQueryOptio
       active = false;
       controller.abort();
     };
-  }, [debouncedQuery, limit]);
+  }, [allowEmptyQuery, debouncedQuery, limit, minChars]);
 
   return {
     data,

@@ -1,4 +1,3 @@
-import { MOCK_RAW_FIXTURES } from "@/features/documents/mock/rawFixtures";
 import {
   applyDocumentsQuery,
   deriveCompaniesFromDocuments,
@@ -42,8 +41,10 @@ function toQueryString(params: Record<string, string | number | undefined>): str
   return serialized ? `?${serialized}` : "";
 }
 
-function getMockRawItems(): RawSourceDocument[] {
-  return [...MOCK_RAW_FIXTURES.nse, ...MOCK_RAW_FIXTURES.bse, ...MOCK_RAW_FIXTURES.sebi];
+async function getMockRawItems(): Promise<RawSourceDocument[]> {
+  const module = await import("@/features/documents/mock/rawFixtures");
+  const fixtures = module.MOCK_RAW_FIXTURES;
+  return [...fixtures.nse, ...fixtures.bse, ...fixtures.sebi];
 }
 
 function filterCompaniesByQuery(companies: CompanyOption[], query?: string): CompanyOption[] {
@@ -65,7 +66,7 @@ export async function fetchCompanies(
   limitOverride?: number
 ): Promise<CompanyOption[]> {
   if (isMockMode()) {
-    const documents = normalizeRawDocuments(getMockRawItems());
+    const documents = normalizeRawDocuments(await getMockRawItems());
     const filtered = filterCompaniesByQuery(deriveCompaniesFromDocuments(documents), query);
     if (Number.isFinite(limitOverride)) {
       return filtered.slice(0, Math.max(1, Math.floor(Number(limitOverride))));
@@ -74,7 +75,11 @@ export async function fetchCompanies(
   }
 
   const normalizedQuery = query?.trim();
-  const dynamicLimit = normalizedQuery ? 1200 : 25000;
+  if (!normalizedQuery && !Number.isFinite(limitOverride)) {
+    return [];
+  }
+
+  const dynamicLimit = normalizedQuery ? 300 : 100;
   const requestedLimit = Number.isFinite(limitOverride)
     ? Math.max(1, Math.min(Math.floor(Number(limitOverride)), dynamicLimit))
     : dynamicLimit;
@@ -104,7 +109,7 @@ export async function fetchCompanies(
 
 export async function fetchDocuments(params: DocumentsQueryParams): Promise<DocumentsResponse> {
   if (isMockMode()) {
-    const normalized = normalizeRawDocuments(getMockRawItems());
+    const normalized = normalizeRawDocuments(await getMockRawItems());
     return applyDocumentsQuery(normalized, params);
   }
 
