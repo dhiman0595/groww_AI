@@ -1,5 +1,5 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ChevronLeft, ChevronRight, Layers3 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type { ChatSource, SummaryCard } from "@/features/documents/api/chatClient";
@@ -67,80 +67,93 @@ export function SummaryDeckView({
           {!currentSummaryCard && activeSummaryDeck.isLoading ? (
             <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-500">
               <span className="size-1.5 rounded-full bg-emerald-500" />
-              Building your first battle card...
+              Building your first knowledge card...
             </div>
           ) : null}
 
           {currentSummaryCard ? (
             <>
               <div className="flex items-center justify-between text-[11px] text-slate-500">
-                <span>
-                  Card {activeSummaryDeck.currentIndex + 1} of {activeSummaryDeck.cards.length}
+                <span className="inline-flex items-center gap-1">
+                  <Layers3 className="size-3.5" />
+                  Knowledge cards
                 </span>
-                <span>Depth level {currentSummaryCard.level}/5</span>
+                <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                  Depth level {currentSummaryCard.level}/5
+                </span>
               </div>
 
-              <article
-                className="relative select-none rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
-                style={{
-                  transform: `translateX(${dragOffsetX}px) rotate(${dragOffsetX / 24}deg)`,
-                  transition: dragStartX === null ? "transform 180ms ease" : "none",
-                  touchAction: "pan-y",
-                }}
-                onPointerDown={onPointerDown}
-                onPointerMove={onPointerMove}
-                onPointerUp={onPointerEnd}
-                onPointerCancel={onPointerEnd}
-              >
-                <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700">
-                  Swipe left: new perspective
-                </div>
-                <div className="pointer-events-none absolute right-3 top-3 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                  Swipe right: deeper from report
-                </div>
+              <div className="relative pb-2 pt-4">
+                <div className="pointer-events-none absolute inset-x-6 top-1 h-[92%] rounded-2xl border border-slate-200 bg-white/75 shadow-sm" />
+                <div className="pointer-events-none absolute inset-x-3 top-2 h-[95%] rounded-2xl border border-slate-200 bg-white/90 shadow-sm" />
 
-                <div className="pt-7">
-                  <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-emerald-700">
-                    {currentSummaryCard.concept}
-                  </Badge>
-                  <h3 className="mt-2 text-base font-semibold text-slate-900">{currentSummaryCard.title}</h3>
-                  <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
-                    {currentSummaryCard.explanation}
-                  </p>
+                <article
+                  className="relative z-10 select-none rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+                  style={{
+                    transform: `translateX(${dragOffsetX}px) rotate(${dragOffsetX / 24}deg)`,
+                    transition: dragStartX === null ? "transform 180ms ease" : "none",
+                    touchAction: "pan-y",
+                  }}
+                  onPointerDown={onPointerDown}
+                  onPointerMove={onPointerMove}
+                  onPointerUp={onPointerEnd}
+                  onPointerCancel={onPointerEnd}
+                >
+                  <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700">
+                    Left: alternate lens
+                  </div>
+                  <div className="pointer-events-none absolute right-3 top-3 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                    Right: go deeper
+                  </div>
 
-                  <div className="mt-3 rounded-lg border border-emerald-100 bg-emerald-50/60 p-2.5">
-                    <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
-                      Why it matters
+                  <div className="pt-7">
+                    <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-emerald-700">
+                      {currentSummaryCard.concept}
+                    </Badge>
+                    <h3 className="mt-2 text-base font-semibold text-slate-900">{currentSummaryCard.title}</h3>
+                    <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
+                      {currentSummaryCard.explanation}
                     </p>
-                    <p className="mt-1 text-xs leading-relaxed text-slate-700">{currentSummaryCard.why_it_matters}</p>
-                  </div>
 
-                  <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5">
-                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Example</p>
-                    <p className="mt-1 text-xs leading-relaxed text-slate-700">{currentSummaryCard.example}</p>
+                    <div className="mt-3 rounded-lg border border-emerald-100 bg-emerald-50/60 p-2.5">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
+                        Why it matters
+                      </p>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-700">{currentSummaryCard.why_it_matters}</p>
+                    </div>
+
+                    <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2.5">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Example</p>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-700">{currentSummaryCard.example}</p>
+                    </div>
                   </div>
+                </article>
+
+                <div className="mt-3 flex items-center justify-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8 border-rose-200 text-rose-700 hover:bg-rose-50"
+                    disabled={activeSummaryDeck.isLoading}
+                    onClick={onRequestLeft}
+                    aria-label="Previous knowledge card perspective"
+                  >
+                    <ChevronLeft className="size-4" />
+                  </Button>
+                  <span className="text-[11px] text-slate-500">Use arrows or swipe</span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8 border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+                    disabled={activeSummaryDeck.isLoading}
+                    onClick={onRequestRight}
+                    aria-label="Next deeper knowledge card"
+                  >
+                    <ChevronRight className="size-4" />
+                  </Button>
                 </div>
-              </article>
-
-              <div className="grid grid-cols-2 gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-10 border-rose-200 text-xs text-rose-700 hover:bg-rose-50"
-                  disabled={activeSummaryDeck.isLoading}
-                  onClick={onRequestLeft}
-                >
-                  I need simpler
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-10 border-emerald-200 text-xs text-emerald-700 hover:bg-emerald-50"
-                  disabled={activeSummaryDeck.isLoading}
-                  onClick={onRequestRight}
-                >
-                  I understand, go deeper
-                </Button>
               </div>
 
               {summarySources.length > 0 ? (

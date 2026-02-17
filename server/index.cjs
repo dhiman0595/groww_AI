@@ -1587,7 +1587,7 @@ function normalizeCardSources(rawSources, fallbackDocument) {
 function normalizeSummaryCard(rawCard, index, documents) {
   const fallbackDocument = documents[index % Math.max(1, documents.length)] || documents[0];
   const concept = `${rawCard?.concept || rawCard?.topic || fallbackDocument?.doc_type || "Concept"}`.trim();
-  const title = `${rawCard?.title || concept || "Understanding card"}`.trim();
+  const title = `${rawCard?.title || concept || "Knowledge card"}`.trim();
   const explanation = `${rawCard?.explanation || rawCard?.summary || ""}`.trim();
   const whyItMatters = `${rawCard?.why_it_matters || rawCard?.whyItMatters || ""}`.trim();
   const example = `${rawCard?.example || rawCard?.analogy || ""}`.trim();
@@ -1616,7 +1616,8 @@ function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
         id: createSummaryCardId(`${symbol}-fallback-1`),
         concept: "Company overview",
         title: `${companyName || symbol}: starting point`,
-        explanation: "No filing text was retrieved for this selection. Start with broader company context before deep analysis.",
+        explanation:
+          "No filing text was retrieved for this selection. Start from company basics, then retry with a filing that has transcript/PDF text.",
         why_it_matters: "Without source filings, confidence in conclusions stays limited.",
         example: "Switch FY or filing scope and retry AI Summary.",
         level: 1,
@@ -1631,31 +1632,40 @@ function buildFallbackSummaryCardsInit({ companyName, symbol, documents }) {
   return [
     {
       id: createSummaryCardId(`${docTitle}-l1`),
-      concept: "What this filing says",
-      title: `Core idea from ${docTitle}`,
-      explanation: `${baseDocument.description || "This filing outlines management updates and reported business context."}`,
-      why_it_matters: "This is the baseline narrative before checking deeper evidence.",
-      example: "Ask: does management tone align with reported trend direction?",
+      concept: "Company overview",
+      title: `${companyName || symbol}: overview`,
+      explanation:
+        `${baseDocument.description || "This filing provides an update on the business and operating direction."}\n\n` +
+        "Focus on what changed this period versus prior period before forming conclusions.",
+      why_it_matters: "A clear high-level snapshot prevents over-indexing on isolated numbers.",
+      example: "Start with segment direction and management priorities before deep metric analysis.",
       level: 1,
       source_refs: sourceRef,
     },
     {
       id: createSummaryCardId(`${docTitle}-l2`),
-      concept: "Evidence linkage",
-      title: "Link commentary to disclosed numbers",
-      explanation: "Match management statements with explicit data points and period labels from the filing.",
-      why_it_matters: "Narrative-only analysis can miss inconsistencies.",
-      example: "Track whether guidance language improved while key metrics also improved.",
+      concept: "What the company does",
+      title: "Business model in plain language",
+      explanation:
+        "Explain the core business engine, revenue drivers, and cost levers using only filing evidence.\n\n" +
+        "Separate stable drivers from cyclical/temporary drivers.",
+      why_it_matters: "Understanding business mechanics is required before interpreting valuation or growth claims.",
+      example: "Map each major segment to one operating driver and one key risk.",
       level: 2,
       source_refs: sourceRef,
     },
     {
       id: createSummaryCardId(`${docTitle}-l3`),
-      concept: "Risk consistency",
-      title: "Stress-test assumptions",
-      explanation: "List what could invalidate the current thesis and which next disclosures would confirm or reject it.",
-      why_it_matters: "Robust understanding requires explicit invalidation triggers.",
-      example: "If margin commentary is positive, verify if cost intensity also improved next quarter.",
+      concept: "Company financial info from filing",
+      title: "Financial and management takeaways",
+      explanation:
+        "Create a structured takeaway using the filing period context:\n" +
+        "1) Key operational highlights\n" +
+        "2) Metric signals (growth, margin, cash, leverage)\n" +
+        "3) Management commentary vs numbers\n" +
+        "4) Risks and monitorables",
+      why_it_matters: "This connects narrative with evidence so users can track the thesis quarter by quarter.",
+      example: "Write each takeaway as: evidence -> interpretation -> what to monitor next.",
       level: 3,
       source_refs: sourceRef,
     },
@@ -1669,7 +1679,7 @@ function buildFallbackNextSummaryCard({ swipeDirection, currentCard, documents }
     ? normalizeCardLevel((currentCard?.level ?? 1) + 1, 2)
     : normalizeCardLevel((currentCard?.level ?? 2) - 1, 1);
   const concept = `${currentCard?.concept || fallbackDocument?.doc_type || "Concept"}`.trim();
-  const title = deeper ? `${concept}: go deeper` : `${concept}: simpler view`;
+  const title = deeper ? `${concept}: deeper layer` : `${concept}: alternate lens`;
 
   return {
     id: createSummaryCardId(`${concept}-${swipeDirection}-${nextLevel}`),
@@ -2243,14 +2253,14 @@ async function generateSummaryCardsWithGrok({
     : docContextLines;
 
   const systemPrompt = [
-    "You are Groww AI card composer for beginners.",
+    "You are Groww AI knowledge-card composer for beginners.",
     "Return strict JSON only. Do not include markdown or extra prose.",
     "Use only provided filing context.",
     "Each card must include: concept, title, explanation, why_it_matters, example, level, source_refs.",
     "Cards must be evidence-grounded and beginner-friendly.",
     "When evidence is weak, say what is not available instead of guessing.",
     "If swipe direction is right: increase depth and specificity, include tighter evidence links from filings.",
-    "If swipe direction is left: keep core meaning but switch to simpler alternate framing (analogy, decomposition, or contrast).",
+    "If swipe direction is left: keep core meaning but switch to clearer alternate framing (analogy, decomposition, or contrast).",
     "For right swipe, level should not decrease. For left swipe, keep level same or reduce by 1 if needed for clarity.",
     "source_refs should be an array of objects with title and optional url/source_name.",
   ].join("\n");
@@ -2260,9 +2270,16 @@ async function generateSummaryCardsWithGrok({
       ? [
           `Company: ${companyName || symbol}`,
           `Symbol: ${symbol}`,
-          "Task: Create 3 progressive summary cards (level 1 -> 3).",
+          "Task: Create 3 progressive knowledge cards (level 1 -> 3).",
+          "Use this exact concept order:",
+          "1) Company overview",
+          "2) What does the company do",
+          "3) Company financial info from the selected filing",
           "Tone: plain language, high clarity, no investment advice.",
-          "Each card should focus on a distinct concept (no repetition).",
+          "For concall/transcript evidence, format card 3 explanation like a compact operational summary:",
+          "- Short heading line with period/context",
+          "- Numbered key takeaways",
+          "- Include at least one 'Actionable investor read' line",
           "Each card should reference evidence through source_refs.",
           "Output JSON shape: {\"cards\":[{...},{...},{...}]}",
           "Context:",
@@ -2274,8 +2291,8 @@ async function generateSummaryCardsWithGrok({
           `Current card: ${JSON.stringify(currentCard)}`,
           `Swipe direction: ${swipeDirection}`,
           swipeDirection === "right"
-            ? "Task: Generate exactly 1 deeper follow-up card with tighter report-grounded evidence and concrete implications."
-            : "Task: Generate exactly 1 alternative-perspective card (different framing) that is easier to grasp without losing factual rigor.",
+            ? "Task: Generate exactly 1 deeper follow-up knowledge card with tighter report-grounded evidence and concrete implications."
+            : "Task: Generate exactly 1 alternate-perspective knowledge card that is easier to grasp without losing factual rigor.",
           "Output JSON shape: {\"cards\":[{...}]}",
           "Context:",
           contextLines,

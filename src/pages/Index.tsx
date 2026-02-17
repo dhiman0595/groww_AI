@@ -217,7 +217,7 @@ function sanitizeSummaryCard(card: SummaryCard): SummaryCard {
   return {
     id: `${card.id || createMessageId()}`,
     concept: `${card.concept || "Concept"}`.trim(),
-    title: `${card.title || "Summary card"}`.trim(),
+    title: `${card.title || "Knowledge card"}`.trim(),
     explanation: `${card.explanation || ""}`.trim(),
     why_it_matters: `${card.why_it_matters || ""}`.trim(),
     example: `${card.example || ""}`.trim(),
@@ -797,6 +797,17 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
     void requestNextSummaryCard(delta > 0 ? "right" : "left");
   }
 
+  function animateAndRequestKnowledgeCard(direction: "left" | "right") {
+    if (activeSummaryDeck.isLoading) {
+      return;
+    }
+    setDragOffsetX(direction === "right" ? 18 : -18);
+    window.setTimeout(() => {
+      setDragOffsetX(0);
+    }, 120);
+    void requestNextSummaryCard(direction);
+  }
+
   function handleSummaryCardPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.pointerType === "mouse" && event.button !== 0) {
       return;
@@ -1114,10 +1125,10 @@ export function IndexPage({ accessMode = "registered", onLogout }: IndexPageProp
                   onPointerMove={handleSummaryCardPointerMove}
                   onPointerEnd={handleSummaryCardPointerEnd}
                   onRequestLeft={() => {
-                    void requestNextSummaryCard("left");
+                    animateAndRequestKnowledgeCard("left");
                   }}
                   onRequestRight={() => {
-                    void requestNextSummaryCard("right");
+                    animateAndRequestKnowledgeCard("right");
                   }}
                 />
               </Suspense>
