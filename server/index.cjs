@@ -67,6 +67,35 @@ const SUMMARY_JSON_MIN_SECTIONS = 3;
 const SUMMARY_JSON_MAX_SECTIONS = 8;
 const SUMMARY_JSON_MIN_METRICS = 5;
 const SUMMARY_JSON_MAX_METRICS = 10;
+
+function isStructuredSummaryQuestion(question) {
+  const normalized = normalizeWhitespace(`${question || ""}`).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (SUMMARY_REGEX.test(normalized)) {
+    return true;
+  }
+
+  if (/\bkey metrics?\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/\bwhat to monitor\b/.test(normalized) || /\bmonitorables?\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/\bwhat\s+(should|do)\s+i\s+track\b/.test(normalized) || /\bwhat\s+should\s+a\s+beginner\s+.*track\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/\bbeginner investor\b/.test(normalized) && /\btrack\b/.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
 const PDF_TEXT_FETCH_TIMEOUT_MS = 12000;
 const PDF_TEXT_MAX_BYTES = 12 * 1024 * 1024;
 const PDF_TEXT_MAX_CHARS = 45000;
@@ -1399,6 +1428,139 @@ function extractMetricSignals(documents) {
   return signals;
 }
 
+function extractStructuredKeyMetrics(documents, ragChunks, limit = SUMMARY_JSON_MAX_METRICS) {
+  const sourceTexts = [];
+
+  if (Array.isArray(ragChunks) && ragChunks.length > 0) {
+    for (const chunk of ragChunks.slice(0, 16)) {
+      sourceTexts.push(`${chunk?.title || ""} ${chunk?.chunk_text || ""}`);
+    }
+  }
+
+  if (sourceTexts.length < 4 && Array.isArray(documents)) {
+    for (const document of documents.slice(0, 10)) {
+      sourceTexts.push(`${document?.title || ""} ${document?.description || ""} ${document?.rag_excerpt || ""}`);
+    }
+  }
+
+  const metricSpecs = [
+    { key: "revenue", label: "Revenue", meaning: "Shows top-line business scale and demand trend." },
+    { key: "total income", label: "Total Income", meaning: "Shows overall income movement across operations." },
+    { key: "profit", label: "Profit", meaning: "Shows bottom-line performance after costs." },
+    { key: "pat", label: "PAT", meaning: "Shows net profit attributable after all expenses." },
+    { key: "ebitda", label: "EBITDA", meaning: "Shows operating profitability before non-cash and financing effects." },
+    { key: "margin", label: "Margin", meaning: "Shows how efficiently income is converted into profit." },
+    { key: "aum", label: "AUM", meaning: "Shows managed asset scale for investment products." },
+    { key: "active users", label: "Active Users", meaning: "Shows user activity and platform engagement trend." },
+    { key: "new user", label: "New User Acquisition", meaning: "Shows growth in new user onboarding." },
+    { key: "order value", label: "Average Order Value", meaning: "Shows average transaction size and user activity quality." },
+    { key: "cash", label: "Cash", meaning: "Shows liquidity and financial buffer." },
+    { key: "debt", label: "Debt", meaning: "Shows leverage risk and repayment burden." },
+  ];
+
+  const extracted = [];
+  const seen = new Set();
+
+  for (const text of sourceTexts) {
+    const normalized = normalizeWhitespace(text).toLowerCase();
+    if (!normalized) {
+      continue;
+    }
+
+    for (const spec of metricSpecs) {
+      if (!normalized.includes(spec.key)) {
+        continue;
+      }
+
+      const regex = new RegExp(`${spec.key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^\\n\\r]{0,80}?(\\d+(?:,\\d{3})*(?:\\.\\d+)?(?:%|x|\\s?(?:cr|crore|lakh|mn|bn|bps))?)`, "i");
+      const match = normalized.match(regex);
+      const value = match?.[1] ? match[1].trim() : NOT_CLEARLY_DISCLOSED_TEXT;
+      const key = `${spec.label.toLowerCase()}|${value.toLowerCase()}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      extracted.push({
+        metric: spec.label,
+        value,
+        what_it_means: trimToWordLimit(spec.meaning, SUMMARY_JSON_WORD_LIMIT),
+      });
+
+      if (extracted.length >= limit) {
+        return extracted;
+      }
+    }
+  }
+
+  return extracted;
+}
+
+function buildFallbackStructuredSummary({ companyName, period, documents, ragChunks }) {
+  const primaryDoc = Array.isArray(documents) && documents.length > 0 ? documents[0] : null;
+  const topLines = Array.isArray(documents)
+    ? documents
+        .slice(0, 4)
+        .map((document) => trimToWordLimit(summarizeDocumentLine(document), SUMMARY_JSON_WORD_LIMIT))
+        .filter((line) => line.length > 0)
+    : [];
+  const keyMetrics = extractStructuredKeyMetrics(documents, ragChunks, SUMMARY_JSON_MAX_METRICS);
+
+  while (keyMetrics.length < SUMMARY_JSON_MIN_METRICS) {
+    keyMetrics.push({
+      metric: `Metric ${keyMetrics.length + 1}`,
+      value: NOT_CLEARLY_DISCLOSED_TEXT,
+      what_it_means: NOT_CLEARLY_DISCLOSED_TEXT,
+    });
+  }
+
+  const sections = [
+    {
+      heading: "Business model breakdown",
+      items: [
+        topLines[0] || NOT_CLEARLY_DISCLOSED_TEXT,
+        trimToWordLimit(
+          primaryDoc?.doc_type
+            ? `Current evidence is mainly from ${primaryDoc.doc_type.toLowerCase()} filings for ${companyName || "the company"}.`
+            : NOT_CLEARLY_DISCLOSED_TEXT,
+          SUMMARY_JSON_WORD_LIMIT
+        ),
+      ],
+    },
+    {
+      heading: "Growth drivers and management commentary",
+      items: [
+        topLines[1] || NOT_CLEARLY_DISCLOSED_TEXT,
+        topLines[2] || NOT_CLEARLY_DISCLOSED_TEXT,
+      ],
+    },
+    {
+      heading: "Beginner focus areas",
+      items: [
+        "Track whether management commentary is supported by disclosed metrics each quarter.",
+        "Track if growth, margins, and user or segment indicators move in the same direction over time.",
+      ],
+    },
+  ];
+
+  return {
+    summary_title: safeSummaryString(`${companyName || "Company"} ${period || "Document Summary"}`, 140),
+    intro: trimToWordLimit(
+      `This summary is generated from retrieved filing text for ${companyName || "the company"} in ${period || "the selected period"}. It focuses on business model, growth drivers, key metrics, and risks using available disclosures only.`,
+      120
+    ),
+    sections,
+    key_metrics: keyMetrics.slice(0, SUMMARY_JSON_MAX_METRICS),
+    risks_and_unknowns: [
+      topLines[3] || NOT_CLEARLY_DISCLOSED_TEXT,
+      "Any missing quantified detail should be treated as not clearly disclosed in the provided document.",
+    ],
+    must_include: [
+      "Business model, growth drivers, key financial metrics, management commentary, and risk checks.",
+      "Unknown or unclear disclosures should be explicitly marked before drawing conclusions.",
+    ],
+  };
+}
+
 function buildDefaultAnswer({ companyName, symbol, question, documents }) {
   const scopeSummary = documents.slice(0, 4).map((document, index) => `${index + 1}. ${summarizeDocumentLine(document)}`);
 
@@ -2583,6 +2745,27 @@ async function answerWithGrok({
   year,
   quarter,
 }) {
+  const summaryPeriod = inferPeriodLabel({
+    year,
+    quarter,
+    documents,
+  });
+
+  if (isSummaryRequest && (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT)) {
+    const fallbackSummary = buildFallbackStructuredSummary({
+      companyName: companyName || symbol,
+      period: summaryPeriod,
+      documents,
+      ragChunks,
+    });
+    return {
+      answer: JSON.stringify(fallbackSummary, null, 2),
+      structured_summary: fallbackSummary,
+      modelUsed: "fallback:rule-based",
+      quality_repair_applied: false,
+    };
+  }
+
   if (!HAS_OLLAMA_CHAT && !HAS_GEMINI_CHAT && !HAS_XAI_CHAT) {
     throw new Error("LLM is not configured. Set OLLAMA_MODEL or GEMINI_API_KEY or XAI_API_KEY on the backend.");
   }
@@ -2597,11 +2780,6 @@ async function answerWithGrok({
 
   if (isSummaryRequest) {
     try {
-      const summaryPeriod = inferPeriodLabel({
-        year,
-        quarter,
-        documents,
-      });
       const summaryDocumentText = buildSummaryDocumentText({
         documents,
         ragChunks,
@@ -2620,7 +2798,19 @@ async function answerWithGrok({
         quality_repair_applied: Boolean(structuredSummaryResult.repaired),
       };
     } catch (error) {
-      console.error("Structured summary generation failed, falling back to narrative summary:", error?.message || error);
+      console.error("Structured summary generation failed, falling back to structured rule-based summary:", error?.message || error);
+      const fallbackSummary = buildFallbackStructuredSummary({
+        companyName: companyName || symbol,
+        period: summaryPeriod,
+        documents,
+        ragChunks,
+      });
+      return {
+        answer: JSON.stringify(fallbackSummary, null, 2),
+        structured_summary: fallbackSummary,
+        modelUsed: "fallback:rule-based",
+        quality_repair_applied: false,
+      };
     }
   }
 
@@ -3180,6 +3370,7 @@ app.post("/api/chat", async (req, res) => {
     const quarter = normalizeYearLabel(req.body.quarter || "");
     const managementFocus = `${req.body.management_focus || ""}`.trim().toLowerCase();
     const filingsFocus = `${req.body.filings_focus || ""}`.trim().toLowerCase();
+    const responseFormat = `${req.body.response_format || ""}`.trim().toLowerCase();
     const history = Array.isArray(req.body.history)
       ? req.body.history
           .slice(-10)
@@ -3292,7 +3483,8 @@ app.post("/api/chat", async (req, res) => {
       docIds.length > 0 ? activeDocuments.filter((document) => docIds.includes(document.id)) : activeDocuments;
     const retrievalPool = scopedByDocIds.length > 0 ? scopedByDocIds : activeDocuments;
 
-    const isSummaryRequest = SUMMARY_REGEX.test(question);
+    const forceStructuredSummary = responseFormat === "summary_json";
+    const isSummaryRequest = forceStructuredSummary || isStructuredSummaryQuestion(question);
     const ranked = rankDocuments(retrievalPool, {
       keywords: tokenize(question),
       selectedQuarter: quarter,

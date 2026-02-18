@@ -18,6 +18,7 @@ export interface ChatRequest {
   quarter?: string;
   management_focus?: string;
   filings_focus?: string;
+  response_format?: "summary_json" | "text";
   history?: ChatTurn[];
 }
 
