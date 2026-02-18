@@ -88,7 +88,7 @@ describe("FlashcardsPanel", () => {
             },
           ],
           why_it_matters: "Growth can continue without fully sacrificing unit economics.",
-          confidence: 0.79,
+          confidence: 0.89,
         },
       ],
     });
@@ -139,7 +139,7 @@ describe("FlashcardsPanel", () => {
             },
           ],
           why_it_matters: "Quarterly earnings quality can vary while acquisition dynamics normalize.",
-          confidence: 0.67,
+          confidence: 0.87,
         },
         {
           id: "762cc03d-fc31-46e5-a9ef-f783f4df33d6",

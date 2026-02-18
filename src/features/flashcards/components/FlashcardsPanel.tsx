@@ -29,6 +29,7 @@ const TAG_FILTER_OPTIONS: Array<"ALL" | FlashcardTag> = [
 ];
 
 const SORT_OPTIONS: FlashcardsSortMode[] = ["materiality", "confidence"];
+const MIN_VISIBLE_CONFIDENCE = 0.85;
 
 interface FlashcardsPanelProps {
   symbol: string;
@@ -51,16 +52,6 @@ function buildPeriodLabel(document: CompanyDocument | null, selectedYear?: strin
   }
 
   return "Latest period";
-}
-
-function toConfidenceColor(confidence: number): string {
-  if (confidence >= 0.85) {
-    return "bg-emerald-500";
-  }
-  if (confidence >= 0.65) {
-    return "bg-amber-500";
-  }
-  return "bg-rose-500";
 }
 
 function toLoadingMessage(stage: FlashcardsLoadingStage): string {
@@ -125,7 +116,8 @@ export function FlashcardsPanel({
       return [];
     }
 
-    const base = tagFilter === "ALL" ? [...data.cards] : data.cards.filter((card) => card.tag === tagFilter);
+    const highConfidenceCards = data.cards.filter((card) => card.confidence >= MIN_VISIBLE_CONFIDENCE);
+    const base = tagFilter === "ALL" ? [...highConfidenceCards] : highConfidenceCards.filter((card) => card.tag === tagFilter);
     if (sortMode === "confidence") {
       base.sort((left, right) => right.confidence - left.confidence);
       return base;
@@ -403,13 +395,12 @@ export function FlashcardsPanel({
               <div className="space-y-2.5">
                 {filteredCards.length === 0 ? (
                   <div className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-500">
-                    No cards match this filter.
+                    No cards meet the minimum confidence threshold (85%) for this filter.
                   </div>
                 ) : null}
 
                 {filteredCards.map((card) => {
                   const isEvidenceExpanded = Boolean(expandedEvidenceIds[card.id]);
-                  const confidencePct = Math.round(card.confidence * 100);
                   return (
                     <article key={card.id} className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
                       <div className="flex items-start justify-between gap-2">
@@ -442,19 +433,6 @@ export function FlashcardsPanel({
                       <div className="mt-2 rounded-lg border border-emerald-100 bg-emerald-50/70 p-2.5">
                         <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">Why it matters</p>
                         <p className="mt-1 text-xs leading-relaxed text-slate-700">{card.why_it_matters}</p>
-                      </div>
-
-                      <div className="mt-2">
-                        <div className="mb-1 flex items-center justify-between text-[11px] text-slate-500">
-                          <span>Confidence</span>
-                          <span>{confidencePct}%</span>
-                        </div>
-                        <div className="h-1.5 w-full rounded-full bg-slate-200">
-                          <div
-                            className={`h-1.5 rounded-full ${toConfidenceColor(card.confidence)}`}
-                            style={{ width: `${confidencePct}%` }}
-                          />
-                        </div>
                       </div>
 
                       <div className="mt-3 flex items-center gap-1.5">
